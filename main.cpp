@@ -26,6 +26,9 @@
 #include <filesystem>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <cctype>
+#include <chrono>
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
@@ -40,6 +43,7 @@
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
+static const char* kVer = "0.0.3";
 
 // ====== Настройка: Azure Client ID для входа через Microsoft (см. объяснение в ответе) ======
 static const std::string kMsClientId = ""; // можно оставить пустым: ID вводится в приложении (вкладка «Аккаунт») и сохраняется в config.json
@@ -125,9 +129,10 @@ static std::string gMsCode, gMsUri;
 struct Account { int type = 0; std::string name, uuid, token, refresh; }; // 0 offline, 1 Ely.by, 2 Microsoft
 static std::optional<Account> gNewAcc;
 static std::atomic<bool> gAuthBusy{false};
-static char bNick[32] = "Player", bElyU[128], bElyP[160], bJava[260], bMsId[96];
+static char bNick[32] = "Player", bElyU[128], bElyP[160], bJava[260], bMsId[96], bJvm[512];
 
-static void Log(const std::string& s) { std::lock_guard<std::mutex> l(gMu); gLog.push_back(s); if (gLog.size() > 3000) gLog.pop_front(); }
+static std::atomic<bool> gLogOn{true};
+static void Log(const std::string& s) { if (!gLogOn) return; std::lock_guard<std::mutex> l(gMu); gLog.push_back(s); if (gLog.size() > 3000) gLog.pop_front(); }
 static void Status(const std::string& s) { { std::lock_guard<std::mutex> l(gMu); gStatus = s; } Log(s); }
 static void ShowError(const std::string& t, const std::string& b) { std::lock_guard<std::mutex> l(gMu); gShowCrash = true; gCrashTitle = t; gCrashBody = b; }
 
@@ -140,8 +145,8 @@ static Resp Http(const std::string& url, const std::string& method = "GET", cons
     if (!WinHttpCrackUrl(w.c_str(), 0, 0, &uc)) return r;
     std::wstring host(uc.lpszHostName, uc.dwHostNameLength), path(uc.lpszUrlPath, uc.dwUrlPathLength + uc.dwExtraInfoLength);
     static HINTERNET ses = [] {
-        HINTERNET h = WinHttpOpen(L"PoltergeistLauncher/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, 0, 0, 0);
-        if (!h) h = WinHttpOpen(L"PoltergeistLauncher/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, 0, 0, 0); // старые Windows (до 8.1)
+        HINTERNET h = WinHttpOpen(L"PoltergeistLauncher/0.0.3 (github.com/PoltergeistTeam/MCL)", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, 0, 0, 0);
+        if (!h) h = WinHttpOpen(L"PoltergeistLauncher/0.0.3 (github.com/PoltergeistTeam/MCL)", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, 0, 0, 0); // старые Windows (до 8.1)
         return h;
     }();
     HINTERNET con = WinHttpConnect(ses, host.c_str(), uc.nPort, 0);
@@ -268,14 +273,18 @@ static std::string PickJava(int need) {
     for (auto& j : js) if (j.major >= need && j.major < bm) { bm = j.major; best = j.exe; }
     return best;
 }
-static std::string EnsureJava(int need) {
-    std::string j = PickJava(need); if (!j.empty()) return j;
+static bool InstallJavaVer(int need) { // скачать и распаковать Temurin JRE нужной версии
     Status("Скачиваю Java " + std::to_string(need) + " (Temurin)...");
     fs::path zip = gRoot / "runtime" / ("temurin-" + std::to_string(need) + ".zip");
     std::string url = "https://api.adoptium.net/v3/binary/latest/" + std::to_string(need) + "/ga/windows/x64/jre/hotspot/normal/eclipse";
-    if (!Download(url, zip, true)) return "";
+    if (!Download(url, zip, true)) return false;
     Unzip(zip, gRoot / "runtime" / std::to_string(need));
     std::error_code ec; fs::remove(zip, ec);
+    return true;
+}
+static std::string EnsureJava(int need) {
+    std::string j = PickJava(need); if (!j.empty()) return j;
+    if (!InstallJavaVer(need)) return "";
     return PickJava(need);
 }
 static std::string JavaExe(std::string p) { // javaw.exe -> java.exe (нужен вывод в консоль)
@@ -480,6 +489,15 @@ static std::string InstallForge(const std::string& mc, const std::string& javaEx
     return id;
 }
 
+// ============================ Выбор видеокарты (Windows) ============================
+static void ApplyGpuPref(const std::string& exe, int mode) { // 0 авто, 1 встроенная (экономия), 2 дискретная (производительность)
+    HKEY k; if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\DirectX\\UserGpuPreference", 0, nullptr, 0, KEY_SET_VALUE, nullptr, &k, nullptr) != ERROR_SUCCESS) return;
+    std::wstring name = W(exe);
+    if (mode == 0) RegDeleteValueW(k, name.c_str());
+    else { std::wstring v = mode == 2 ? L"GpuPreference=2;" : L"GpuPreference=1;"; RegSetValueExW(k, name.c_str(), 0, REG_SZ, (const BYTE*)v.c_str(), (DWORD)((v.size() + 1) * sizeof(wchar_t))); }
+    RegCloseKey(k);
+}
+
 // ============================ Запуск процесса и разбор крашей ============================
 static int RunProcess(const std::string& cmd, const fs::path& cwd, std::string& captured) {
     SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
@@ -673,12 +691,16 @@ struct Config {
     std::string gameDir; // пусто = стандартная
     bool snapshots = false, showBeta = false, showAlpha = false, slideshow = true;
     int ramMB = 4096, sel = -1, onLaunch = 0; // onLaunch: 0 оставить, 1 свернуть, 2 закрыть
+    int lang = 0, color = 1, gpu = 0, modSrc = 0; // язык (0 ru, 1 en), цвет лаунчера (0..4), видеокарта, сайт модов (0 Modrinth, 1 CurseForge)
+    bool light = false, rounded = true, modsOn = true, logsOn = true;
+    std::string jvmArgs;
     std::vector<Account> accs;
 };
 static Config cfg;
 static void SaveConfig() {
     json j; j["loader"] = cfg.loader; j["version"] = cfg.version; j["java"] = cfg.javaPath; j["bg"] = cfg.bg; j["shots"] = cfg.shotsDir;
     j["snap"] = cfg.snapshots; j["slide"] = cfg.slideshow; j["ram"] = cfg.ramMB; j["sel"] = cfg.sel; j["msid"] = MsId(); j["gamedir"] = cfg.gameDir; j["beta"] = cfg.showBeta; j["alpha"] = cfg.showAlpha; j["onlaunch"] = cfg.onLaunch;
+    j["lang"] = cfg.lang; j["color"] = cfg.color; j["gpu"] = cfg.gpu; j["modsrc"] = cfg.modSrc; j["light"] = cfg.light; j["round"] = cfg.rounded; j["mods"] = cfg.modsOn; j["logs"] = cfg.logsOn; j["jvm"] = cfg.jvmArgs;
     for (auto& a : cfg.accs) j["accs"].push_back({{"type", a.type}, {"name", a.name}, {"uuid", a.uuid}, {"token", a.token}, {"refresh", a.refresh}});
     WriteAll(gCfgDir / "config.json", j.dump(2));
 }
@@ -689,6 +711,8 @@ static void LoadConfig() {
         cfg.snapshots = j.value("snap", false); cfg.slideshow = j.value("slide", true); cfg.ramMB = j.value("ram", 4096); cfg.sel = j.value("sel", -1);
         { std::string id = j.value("msid", ""); if (!id.empty()) SetMsId(id); }
         cfg.gameDir = j.value("gamedir", ""); cfg.showBeta = j.value("beta", false); cfg.showAlpha = j.value("alpha", false); cfg.onLaunch = j.value("onlaunch", 0);
+        cfg.lang = j.value("lang", 0); cfg.color = j.value("color", 1); cfg.gpu = j.value("gpu", 0); cfg.modSrc = j.value("modsrc", 0); cfg.light = j.value("light", false); cfg.rounded = j.value("round", true);
+        cfg.modsOn = j.value("mods", true); cfg.logsOn = j.value("logs", true); cfg.jvmArgs = j.value("jvm", "");
         if (j.contains("accs")) for (auto& a : j["accs"]) cfg.accs.push_back({a.value("type", 0), a.value("name", ""), a.value("uuid", ""), a.value("token", ""), a.value("refresh", "")});
     } catch (...) {}
 }
@@ -733,7 +757,7 @@ static void LaunchThread(Config c, Account acc) {
             {"auth_player_name", acc.name}, {"version_name", launchId}, {"game_directory", PS(gameDir)}, {"assets_root", PS(gRoot / "assets")},
             {"assets_index_name", pp.assetsId}, {"auth_uuid", acc.uuid}, {"auth_access_token", acc.type == 0 ? "0" : acc.token}, {"clientid", ""}, {"auth_xuid", ""},
             {"user_type", acc.type == 2 ? "msa" : (acc.type == 1 ? "mojang" : "legacy")}, {"version_type", lv.value("type", "release")},
-            {"natives_directory", PS(pp.natives)}, {"launcher_name", "PoltergeistLauncher"}, {"launcher_version", "1.0"}, {"classpath", pp.cp},
+            {"natives_directory", PS(pp.natives)}, {"launcher_name", "PoltergeistLauncher"}, {"launcher_version", kVer}, {"classpath", pp.cp},
             {"classpath_separator", ";"}, {"library_directory", PS(gRoot / "libraries")}, {"game_assets", pp.gameAssets},
             {"auth_session", acc.token}, {"user_properties", "{}"}};
         std::string base = lv.value("_base", c.version);
@@ -762,6 +786,8 @@ static void LaunchThread(Config c, Account acc) {
             if (!Download(kAuthlibUrl, ai)) throw std::runtime_error("Не скачался authlib-injector (нужен для Ely.by)");
             cmd += " " + Q("-javaagent:" + PS(ai) + "=https://authserver.ely.by/api/authlib-injector");
         }
+        if (!c.jvmArgs.empty()) cmd += " " + c.jvmArgs;
+        ApplyGpuPref(JavaExe(java), c.gpu);
         for (auto& s : jvm) cmd += " " + Q(s);
         cmd += " " + Q(lv.value("mainClass", "net.minecraft.client.main.Main"));
         for (auto& s : game) cmd += " " + Q(s);
@@ -776,7 +802,7 @@ static void LaunchThread(Config c, Account acc) {
         std::string cap; int code = RunProcess(cmd, gameDir, cap);
         gGameRunning = false;
         if (act == 1) PostMessageW(gHwnd, WM_SYSCOMMAND, SC_RESTORE, 0); // игра закрылась — вернуть лаунчер
-        WriteAll(gCfgDir / "latest.log", cap);
+        if (gLogOn) WriteAll(gCfgDir / "latest.log", cap);
         if (code != 0) { auto [t, b] = Analyze(code, cap); Status("Игра завершилась с ошибкой: " + t); ShowError(t, b); }
         else Status("Игра закрыта");
     } catch (std::exception& e) {
@@ -875,9 +901,43 @@ static std::string PickImage(HWND hw) {
 }
 
 // ============================ UI ============================
-static int gTab = 0; static float gTabFade = 1;
-static const ImVec4 kAccent(0.33f, 0.78f, 0.40f, 1.f);
-static const char* kTabs[] = {"Игра", "Аккаунт", "Настройки", "Лог"};
+enum { S_MAIN, S_ACC, S_MODS, S_SET, S_LOG };
+static int gScr = S_MAIN, gSetTab = 0; static float gScrFade = 1;
+static void Go(int s) { if (gScr != s) { gScr = s; gScrFade = 0; } }
+static float gS = 1.f; static int gThemeSig = -1;
+static ImVec4 gAccent(0.33f, 0.78f, 0.40f, 1.f), gSoft(1.f, 1.f, 1.f, 0.12f);
+static const ImVec4 kPalette[5] = {ImVec4(0.26f, 0.52f, 0.96f, 1.f), ImVec4(0.33f, 0.78f, 0.40f, 1.f), ImVec4(0.92f, 0.30f, 0.30f, 1.f),
+                                   ImVec4(0.96f, 0.77f, 0.20f, 1.f), ImVec4(0.25f, 0.80f, 0.92f, 1.f)}; // синий, зелёный, красный, жёлтый, голубой
+static const char* T(const char* ru, const char* en) { return cfg.lang == 1 ? en : ru; }
+static float R(float v) { return cfg.rounded ? v : 0.f; }
+static ImU32 TextCol(float a = 1.f) { ImVec4 c = ImGui::GetStyleColorVec4(ImGuiCol_Text); c.w *= a; return ImGui::GetColorU32(c); }
+static ImU32 OnAccent(float a = 1.f) {
+    float l = .299f * gAccent.x + .587f * gAccent.y + .114f * gAccent.z;
+    return ImGui::GetColorU32(l > 0.64f ? ImVec4(.08f, .09f, .12f, a) : ImVec4(1.f, 1.f, 1.f, a));
+}
+static void TD(const char* s) { ImGui::TextDisabled("%s", s); }
+
+static void ApplyTheme() {
+    gAccent = kPalette[std::clamp(cfg.color, 0, 4)];
+    gSoft = cfg.light ? ImVec4(0.f, 0.f, 0.f, .08f) : ImVec4(1.f, 1.f, 1.f, .12f);
+    ImGuiStyle& st = ImGui::GetStyle(); st = ImGuiStyle();
+    if (cfg.light) ImGui::StyleColorsLight(&st); else ImGui::StyleColorsDark(&st);
+    float r = cfg.rounded ? 1.f : 0.f;
+    st.FrameRounding = 8 * r; st.PopupRounding = 10 * r; st.GrabRounding = 8 * r; st.ScrollbarRounding = 8 * r; st.WindowRounding = 12 * r; st.ChildRounding = 8 * r;
+    st.FramePadding = ImVec2(10, 7); st.ItemSpacing = ImVec2(10, 10); st.ScaleAllSizes(gS);
+    ImVec4* c = st.Colors;
+    if (cfg.light) {
+        c[ImGuiCol_Text] = ImVec4(.09f, .10f, .14f, 1.f); c[ImGuiCol_TextDisabled] = ImVec4(.40f, .42f, .48f, 1.f);
+        c[ImGuiCol_FrameBg] = ImVec4(0, 0, 0, .07f); c[ImGuiCol_FrameBgHovered] = ImVec4(0, 0, 0, .12f); c[ImGuiCol_FrameBgActive] = ImVec4(0, 0, 0, .16f);
+        c[ImGuiCol_PopupBg] = ImVec4(.97f, .98f, 1.f, .98f); c[ImGuiCol_Button] = ImVec4(0, 0, 0, .10f);
+    } else {
+        c[ImGuiCol_FrameBg] = ImVec4(1, 1, 1, .08f); c[ImGuiCol_FrameBgHovered] = ImVec4(1, 1, 1, .14f); c[ImGuiCol_FrameBgActive] = ImVec4(1, 1, 1, .18f);
+        c[ImGuiCol_PopupBg] = ImVec4(.08f, .09f, .13f, .98f); c[ImGuiCol_Button] = ImVec4(1, 1, 1, .12f);
+    }
+    c[ImGuiCol_CheckMark] = cfg.light ? gAccent : gAccent; c[ImGuiCol_SliderGrab] = gAccent; c[ImGuiCol_SliderGrabActive] = gAccent;
+    c[ImGuiCol_Header] = ImVec4(gAccent.x, gAccent.y, gAccent.z, .35f); c[ImGuiCol_HeaderHovered] = ImVec4(gAccent.x, gAccent.y, gAccent.z, .5f);
+    c[ImGuiCol_ButtonHovered] = ImVec4(gAccent.x, gAccent.y, gAccent.z, .45f); c[ImGuiCol_ButtonActive] = ImVec4(gAccent.x, gAccent.y, gAccent.z, .6f);
+}
 
 static float Anim(ImGuiID id, float target, float speed, float def = 0.f) {
     float& v = *ImGui::GetStateStorage()->GetFloatRef(id, def);
@@ -887,37 +947,61 @@ static float AnimK(const char* k, float target, float speed, float def = 0.f) { 
 
 static bool FancyBtn(const char* label, ImVec2 sz, ImVec4 col, bool enabled = true) {
     ImGui::PushID(label);
+    const char* hid = strstr(label, "##"); // видимая часть — до "##"
     if (sz.x <= 0) sz.x = ImGui::GetContentRegionAvail().x;
     ImVec2 p = ImGui::GetCursorScreenPos();
     bool clk = ImGui::InvisibleButton("##b", sz);
     bool hov = ImGui::IsItemHovered() && enabled, act = ImGui::IsItemActive() && enabled;
     float t = AnimK("h", hov ? 1.f : 0.f, 14.f), g = t * 2.5f - (act ? 2.5f : 0.f);
-    ImVec4 c = col; if (!enabled) { c.x *= .45f; c.y *= .45f; c.z *= .45f; }
-    c.x = std::min(1.f, c.x + .12f * t); c.y = std::min(1.f, c.y + .12f * t); c.z = std::min(1.f, c.z + .12f * t);
+    bool strong = col.w >= 0.85f; ImVec4 c = col;
+    if (strong) {
+        float k = enabled ? 1.f : .45f; c.x *= k; c.y *= k; c.z *= k;
+        c.x = std::min(1.f, c.x + .12f * t); c.y = std::min(1.f, c.y + .12f * t); c.z = std::min(1.f, c.z + .12f * t);
+    } else c.w = std::min(1.f, c.w * (enabled ? 1.f : .5f) + .08f * t);
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddRectFilled(ImVec2(p.x - g, p.y - g), ImVec2(p.x + sz.x + g, p.y + sz.y + g), ImGui::GetColorU32(c), sz.y * 0.28f);
-    ImVec2 ts = ImGui::CalcTextSize(label);
-    dl->AddText(ImVec2(p.x + (sz.x - ts.x) / 2, p.y + (sz.y - ts.y) / 2), IM_COL32(255, 255, 255, enabled ? 255 : 140), label);
+    dl->AddRectFilled(ImVec2(p.x - g, p.y - g), ImVec2(p.x + sz.x + g, p.y + sz.y + g), ImGui::GetColorU32(c), R(sz.y * 0.28f));
+    ImVec2 ts = ImGui::CalcTextSize(label, hid);
+    ImU32 tc = strong ? OnAccent(enabled ? 1.f : .55f) : TextCol(enabled ? 1.f : .5f);
+    dl->AddText(ImVec2(p.x + (sz.x - ts.x) / 2, p.y + (sz.y - ts.y) / 2), tc, label, hid);
     ImGui::PopID();
     return clk && enabled;
 }
+static bool BackBtn(ImVec2 sz) { // кнопка «назад» со стрелкой
+    bool clk = FancyBtn("##back", sz, gSoft);
+    ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax(), m((a.x + b.x) / 2, (a.y + b.y) / 2);
+    float s = (b.y - a.y) * .22f, th = 2.f * gS; ImU32 col = TextCol(); ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddLine(ImVec2(m.x + s * 1.5f, m.y), ImVec2(m.x - s * 1.5f, m.y), col, th);
+    dl->AddLine(ImVec2(m.x - s * 1.5f, m.y), ImVec2(m.x - s * .4f, m.y - s * 1.1f), col, th);
+    dl->AddLine(ImVec2(m.x - s * 1.5f, m.y), ImVec2(m.x - s * .4f, m.y + s * 1.1f), col, th);
+    return clk;
+}
+static void IconCheck(ImDrawList* dl, ImVec2 m, float s, ImU32 col) {
+    float th = 2.5f * gS;
+    dl->AddLine(ImVec2(m.x - s, m.y), ImVec2(m.x - s * .3f, m.y + s * .7f), col, th);
+    dl->AddLine(ImVec2(m.x - s * .3f, m.y + s * .7f), ImVec2(m.x + s, m.y - s * .7f), col, th);
+}
+static void IconCross(ImDrawList* dl, ImVec2 m, float s, ImU32 col) {
+    float th = 2.5f * gS;
+    dl->AddLine(ImVec2(m.x - s * .8f, m.y - s * .8f), ImVec2(m.x + s * .8f, m.y + s * .8f), col, th);
+    dl->AddLine(ImVec2(m.x - s * .8f, m.y + s * .8f), ImVec2(m.x + s * .8f, m.y - s * .8f), col, th);
+}
 static void Open(const fs::path& p) { std::error_code ec; fs::create_directories(p, ec); ShellExecuteW(0, L"open", p.wstring().c_str(), 0, 0, SW_SHOWNORMAL); }
-static std::string AccLabel(const Account& a) { return (a.type == 0 ? "[офлайн] " : a.type == 1 ? "[Ely.by] " : "[Microsoft] ") + a.name; }
+static std::string AccLabel(const Account& a) { return std::string(a.type == 0 ? T("[офлайн] ", "[offline] ") : a.type == 1 ? "[Ely.by] " : "[Microsoft] ") + a.name; }
 
-static void TabBar() {
+static void TabBar(const char* const* labels, int n, int& cur) {
     float em = ImGui::GetFontSize(), h = em * 1.9f; ImVec2 s = ImGui::GetCursorScreenPos(); float x = s.x, tx = s.x, tw = 0;
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    for (int i = 0; i < 4; i++) {
-        ImVec2 ts = ImGui::CalcTextSize(kTabs[i]); float w = ts.x + em * 1.2f;
+    for (int i = 0; i < n; i++) {
+        ImVec2 ts = ImGui::CalcTextSize(labels[i]); float w = ts.x + em * 1.2f;
         ImGui::SetCursorScreenPos(ImVec2(x, s.y)); ImGui::PushID(i);
-        if (ImGui::InvisibleButton("##t", ImVec2(w, h)) && gTab != i) { gTab = i; gTabFade = 0; }
-        float t = AnimK("h", (ImGui::IsItemHovered() || gTab == i) ? 1.f : 0.f, 12.f);
-        dl->AddText(ImVec2(x + em * .6f, s.y + (h - ts.y) / 2), IM_COL32(255, 255, 255, (int)(125 + 130 * t)), kTabs[i]);
-        if (gTab == i) { tx = x; tw = w; }
+        if (ImGui::InvisibleButton("##t", ImVec2(w, h)) && cur != i) { cur = i; gScrFade = 0; }
+        float t = AnimK("h", (ImGui::IsItemHovered() || cur == i) ? 1.f : 0.f, 12.f);
+        dl->AddText(ImVec2(x + em * .6f, s.y + (h - ts.y) / 2), TextCol(.5f + .5f * t), labels[i]);
+        if (cur == i) { tx = x; tw = w; }
         x += w; ImGui::PopID();
     }
     float ux = AnimK("ux", tx, 12.f, tx), uw = AnimK("uw", tw, 12.f, tw);
-    dl->AddRectFilled(ImVec2(ux + em * .4f, s.y + h), ImVec2(ux + uw - em * .4f, s.y + h + 3), ImGui::GetColorU32(kAccent), 2.f);
+    dl->AddRectFilled(ImVec2(ux + em * .4f, s.y + h), ImVec2(ux + uw - em * .4f, s.y + h + 3), ImGui::GetColorU32(gAccent), 2.f);
     ImGui::SetCursorScreenPos(ImVec2(s.x, s.y + h + em * .8f));
 }
 static bool VerShown(const Ver& v, const std::string& loader) { // вызывать под gVerMu
@@ -941,149 +1025,445 @@ static fs::path CurrentInstanceDir() { // папка игры для выбра�
     else if (cfg.loader == "Forge") { std::string n = find(cfg.version + "-forge-", ""); if (!n.empty()) id = n; }
     return gRoot / "instances" / P(id);
 }
-static void TabGame() {
-    float em = ImGui::GetFontSize(); ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImGui::TextDisabled("Версия");
-    std::string vl = cfg.loader + "   " + (cfg.version.empty() ? std::string("загрузка...") : cfg.version);
-    if (FancyBtn(vl.c_str(), ImVec2(0, em * 2.2f), ImVec4(1, 1, 1, 0.12f))) ImGui::OpenPopup("##vers");
-    ImVec2 bmin = ImGui::GetItemRectMin(), bmax = ImGui::GetItemRectMax();
-    ImGui::SetNextWindowPos(ImVec2(bmin.x, bmax.y + 4));
-    ImGui::SetNextWindowSize(ImVec2(bmax.x - bmin.x, em * 19));
-    if (ImGui::BeginPopup("##vers")) {
-        const char* ld[] = {"Vanilla", "Fabric", "Forge"}; float sp = ImGui::GetStyle().ItemSpacing.x, bw = (ImGui::GetContentRegionAvail().x - 2 * sp) / 3;
-        for (int i = 0; i < 3; i++) {
-            if (i) ImGui::SameLine();
-            bool sel = cfg.loader == ld[i];
-            if (FancyBtn(ld[i], ImVec2(bw, em * 1.9f), sel ? kAccent : ImVec4(1, 1, 1, 0.10f)) && !sel) {
-                cfg.loader = ld[i];
-                std::lock_guard<std::mutex> l(gVerMu); bool ok = false;
-                for (auto& v : gVers) if (v.id == cfg.version && VerShown(v, cfg.loader)) ok = true;
-                if (!ok) { // выбранной версии у этого загрузчика нет — берём самую новую подходящую
-                    for (auto& v : gVers) if (v.type == "release" && VerShown(v, cfg.loader)) { cfg.version = v.id; ok = true; break; }
-                    if (!ok) for (auto& v : gVers) if (VerShown(v, cfg.loader)) { cfg.version = v.id; break; }
+
+// ---------- Java: список установленных и установка ----------
+static const int kJavaVers[] = {8, 17, 21, 25};
+static std::vector<JavaInfo> gJavas; static std::mutex gJavaMu; static std::atomic<bool> gJavaScan{false}; static std::atomic<int> gJavaInst{0};
+static void RefreshJavas() {
+    if (gJavaScan.exchange(true)) return;
+    std::thread([] { auto j = FindJavas(); { std::lock_guard<std::mutex> l(gJavaMu); gJavas = j; } gJavaScan = false; }).detach();
+}
+static void JavaInstallThread(int v) {
+    gJavaInst = v;
+    bool ok = InstallJavaVer(v);
+    Status(ok ? "Java " + std::to_string(v) + " установлена" : "Не удалось скачать Java " + std::to_string(v));
+    { auto j = FindJavas(); std::lock_guard<std::mutex> l(gJavaMu); gJavas = j; }
+    gJavaInst = 0;
+}
+
+// ---------- Моды (Modrinth) ----------
+struct ModHit { std::string id, title, desc, author; long long dl = 0; };
+static std::vector<ModHit> gModHits; static std::mutex gModMu; static std::string gModMsg, gModKey, gWantQ, gModChk;
+static std::set<std::string> gModDone; static std::atomic<bool> gModBusy{false}, gModInst{false}, gModChkBusy{false};
+static char bModQ[96];
+static std::string LoaderId(const std::string& l) { return l == "Fabric" ? "fabric" : l == "Forge" ? "forge" : ""; }
+static void ModMsg(const std::string& s) { { std::lock_guard<std::mutex> l(gModMu); gModMsg = s; } Log(s); }
+static void ModSearchThread(std::string q, std::string loader, std::string mc) {
+    gModBusy = true;
+    try {
+        std::string fac = "[[\"project_type:mod\"],[\"categories:" + loader + "\"],[\"versions:" + mc + "\"]]";
+        std::string url = "https://api.modrinth.com/v2/search?query=" + UrlEnc(q) + "&facets=" + UrlEnc(fac) + "&limit=40&index=" + (q.empty() ? "downloads" : "relevance");
+        Resp r = Http(url); json j = Parse(r.body); std::vector<ModHit> out;
+        if (r.status == 200 && j.is_object() && j.contains("hits") && j["hits"].is_array())
+            for (auto& h : j["hits"]) {
+                ModHit m; m.id = JStr(h, "project_id"); m.title = JStr(h, "title"); m.desc = JStr(h, "description"); m.author = JStr(h, "author");
+                if (h.contains("downloads") && h["downloads"].is_number()) m.dl = h["downloads"].get<long long>();
+                if (!m.id.empty()) out.push_back(m);
+            }
+        std::lock_guard<std::mutex> l(gModMu); gModHits = out;
+        if (r.status != 200) gModMsg = T("Нет связи с Modrinth (интернет / VPN / фаервол)", "Cannot reach Modrinth (internet / VPN / firewall)");
+        else if (out.empty()) gModMsg = T("Ничего не найдено для этой версии и загрузчика", "Nothing found for this version and loader");
+        else gModMsg.clear();
+    } catch (std::exception& e) { ModMsg(std::string("Modrinth: ") + e.what()); }
+    gModBusy = false;
+}
+static bool InstallModRec(const std::string& pid, const std::string& loader, const std::string& mc, const fs::path& dir, std::set<std::string>& seen, int depth) {
+    if (!seen.insert(pid).second) return true;
+    Resp r = Http("https://api.modrinth.com/v2/project/" + UrlEnc(pid) + "/version?loaders=" + UrlEnc("[\"" + loader + "\"]") + "&game_versions=" + UrlEnc("[\"" + mc + "\"]"));
+    if (r.status == 0) throw std::runtime_error(T("Нет соединения с Modrinth", "No connection to Modrinth"));
+    json a = Parse(r.body);
+    if (r.status != 200 || !a.is_array() || a.empty()) return false;
+    const json* pick = &a[0];
+    for (auto& v : a) if (JStr(v, "version_type") == "release") { pick = &v; break; }
+    if (!pick->is_object() || !pick->contains("files") || !(*pick)["files"].is_array() || (*pick)["files"].empty()) return false;
+    const json& files = (*pick)["files"]; const json* f = &files[0];
+    for (auto& x : files) if (x.is_object() && x.contains("primary") && x["primary"].is_boolean() && x["primary"].get<bool>()) { f = &x; break; }
+    std::string fn = U8(fs::path(W(JStr(*f, "filename"))).filename().wstring()), url = JStr(*f, "url");
+    if (fn.empty() || url.empty()) return false;
+    std::error_code ec; fs::create_directories(dir, ec);
+    ModMsg(std::string(T("Скачиваю ", "Downloading ")) + fn);
+    if (!Download(url, dir / P(fn))) throw std::runtime_error(std::string(T("Не удалось скачать ", "Failed to download ")) + fn);
+    if (depth < 3 && pick->contains("dependencies") && (*pick)["dependencies"].is_array())
+        for (auto& d : (*pick)["dependencies"]) {
+            if (JStr(d, "dependency_type") != "required") continue;
+            std::string dp = JStr(d, "project_id"); if (dp.empty()) continue;
+            try { InstallModRec(dp, loader, mc, dir, seen, depth + 1); } catch (...) {}
+        }
+    return true;
+}
+static fs::path ResolveInstanceDir(const std::string& loader, const std::string& mc) { // та же папка, в которую потом запустится игра
+    std::string id = mc;
+    try {
+        if (loader == "Fabric") { std::string have = InstallFabric(mc); if (!have.empty()) id = have; }
+        else if (loader == "Forge") {
+            std::string fv; Resp r = Http("https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json"); json j = Parse(r.body);
+            if (j.is_object() && j.contains("promos")) {
+                auto& pr = j["promos"];
+                if (pr.contains(mc + "-recommended")) fv = pr[mc + "-recommended"].get<std::string>();
+                else if (pr.contains(mc + "-latest")) fv = pr[mc + "-latest"].get<std::string>();
+            }
+            std::string have = fv.empty() ? FindInstalled(mc + "-forge-", "") : mc + "-forge-" + fv; if (!have.empty()) id = have;
+        }
+    } catch (...) {}
+    return gRoot / "instances" / P(id);
+}
+static void ModInstallThread(std::string pid, std::string title, std::string loader, std::string mc) {
+    gModInst = true;
+    try {
+        fs::path dir = ResolveInstanceDir(loader, mc) / "mods"; std::set<std::string> seen;
+        if (InstallModRec(pid, loader, mc, dir, seen, 0)) { { std::lock_guard<std::mutex> l(gModMu); gModDone.insert(pid); } ModMsg(std::string(T("Установлено: ", "Installed: ")) + title); }
+        else ModMsg(cfg.lang == 1 ? "No versions of \"" + title + "\" for " + loader + " " + mc : "Для мода «" + title + "» нет версий под " + loader + " " + mc);
+    } catch (std::exception& e) { ModMsg(std::string(T("Ошибка: ", "Error: ")) + e.what()); }
+    gModInst = false;
+}
+static void ModrinthCheckThread() {
+    if (gModChkBusy.exchange(true)) return;
+    { std::lock_guard<std::mutex> l(gModMu); gModChk = T("Проверяю...", "Checking..."); }
+    auto t0 = std::chrono::steady_clock::now(); Resp r = Http("https://api.modrinth.com/");
+    int ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    { std::lock_guard<std::mutex> l(gModMu); gModChk = r.status == 200 ? std::string(T("Modrinth доступен (", "Modrinth is reachable (")) + std::to_string(ms) + (cfg.lang == 1 ? " ms)" : " мс)")
+                                                                          : std::string(T("Нет связи с Modrinth", "Cannot reach Modrinth")) + (r.status ? " (" + std::to_string(r.status) + ")" : ""); }
+    gModChkBusy = false;
+}
+
+// ---------- Новости ----------
+struct NewsItem { const char* ver; const char* ru; const char* en; };
+static const NewsItem kNews[] = { // новые сверху
+    {"v0.0.3", "Добавлено больше настроек. И моды.", "More settings added. And mods."},
+    {"v0.0.2", "Hotfix Java. Скачивалась не та версия для 26.1-26.3.", "Java hotfix. The wrong Java version was downloaded for 26.1-26.3."},
+    {"v0.0.1", "Добро пожаловать в ОБТ PoltergeistLauncher. Пока контента мало, с обновлениями будем добавлять его.", "Welcome to the PoltergeistLauncher open beta. There is little content for now, we will add more with updates."},
+};
+
+static bool Header(const char* title) { // заголовок экрана + стрелка «назад» справа; true = нажали «назад»
+    float em = ImGui::GetFontSize(); ImVec2 st = ImGui::GetCursorPos(); float w = ImGui::GetContentRegionAvail().x, bh = em * 2.2f, bw = em * 3.4f;
+    ImGui::SetWindowFontScale(1.5f); ImVec2 ts = ImGui::CalcTextSize(title);
+    ImGui::SetCursorPos(ImVec2(st.x, st.y + (bh - ts.y) / 2)); ImGui::TextColored(gAccent, "%s", title); ImGui::SetWindowFontScale(1.f);
+    ImGui::SetCursorPos(ImVec2(st.x + w - bw, st.y)); bool back = BackBtn(ImVec2(bw, bh));
+    ImGui::SetCursorPos(ImVec2(st.x, st.y + bh + em * .6f));
+    return back;
+}
+static bool ComboI(const char* id, int& cur, const char* const* items, int n) {
+    bool ch = false; ImGui::SetNextItemWidth(std::min(ImGui::GetFontSize() * 18.f, ImGui::GetContentRegionAvail().x));
+    if (ImGui::BeginCombo(id, items[std::clamp(cur, 0, n - 1)])) {
+        for (int i = 0; i < n; i++) if (ImGui::Selectable(items[i], cur == i)) { cur = i; ch = true; }
+        ImGui::EndCombo();
+    }
+    return ch;
+}
+
+// ---------- Главный экран ----------
+static void ScrMain() {
+    float em = ImGui::GetFontSize(); ImGuiStyle& sty = ImGui::GetStyle(); ImDrawList* dl = ImGui::GetWindowDrawList();
+    { // шапка: название слева, версия и «Настройки» справа
+        ImVec2 st = ImGui::GetCursorPos(); float w = ImGui::GetContentRegionAvail().x, bh = em * 2.2f, bw = em * 8.f;
+        ImGui::SetWindowFontScale(1.5f); ImVec2 ts = ImGui::CalcTextSize("PoltergeistLauncher");
+        ImGui::SetCursorPos(ImVec2(st.x, st.y + (bh - ts.y) / 2)); ImGui::TextColored(gAccent, "PoltergeistLauncher"); ImGui::SetWindowFontScale(1.f);
+        std::string vs = std::string("v") + kVer; ImVec2 vz = ImGui::CalcTextSize(vs.c_str());
+        ImGui::SetCursorPos(ImVec2(st.x + w - bw - vz.x - em * .7f, st.y + (bh - vz.y) / 2)); ImGui::TextDisabled("%s", vs.c_str());
+        ImGui::SetCursorPos(ImVec2(st.x + w - bw, st.y));
+        if (FancyBtn(T("Настройки", "Settings"), ImVec2(bw, bh), gSoft)) Go(S_SET);
+        ImGui::SetCursorPos(ImVec2(st.x, st.y + bh + em * .8f));
+    }
+    { // «Новости» по центру
+        ImGui::SetWindowFontScale(1.25f); const char* nt = T("Новости", "News"); float tw = ImGui::CalcTextSize(nt).x;
+        ImGui::SetCursorPosX((ImGui::GetWindowWidth() - tw) / 2); ImGui::TextUnformatted(nt); ImGui::SetWindowFontScale(1.f);
+    }
+    float bottomH = em * 6.3f + sty.ItemSpacing.y * 3;
+    ImGui::BeginChild("news", ImVec2(0, std::max(em * 4.f, ImGui::GetContentRegionAvail().y - bottomH)), 0, ImGuiWindowFlags_NoBackground);
+    for (auto& n : kNews) {
+        float aw = ImGui::GetContentRegionAvail().x, cw = std::min(aw, em * 42.f); ImVec2 p = ImGui::GetCursorScreenPos(); float x0 = p.x + (aw - cw) / 2;
+        float tw = cw - em * 2; const char* txt = T(n.ru, n.en); ImVec2 ts = ImGui::CalcTextSize(txt, nullptr, false, tw);
+        float ch = em * .8f + em * 1.4f + ts.y + em * .8f;
+        dl->AddRectFilled(ImVec2(x0, p.y), ImVec2(x0 + cw, p.y + ch), ImGui::GetColorU32(gSoft), R(em * .6f));
+        dl->AddText(ImVec2(x0 + em, p.y + em * .8f), ImGui::GetColorU32(gAccent), n.ver);
+        dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(x0 + em, p.y + em * .8f + em * 1.4f), TextCol(.9f), txt, nullptr, tw);
+        ImGui::Dummy(ImVec2(aw, ch));
+    }
+    ImGui::EndChild();
+
+    // строка статуса + прогресс слева, мелкие кнопки справа
+    float full = ImGui::GetContentRegionAvail().x, sbw = em * 5.4f, rowH = em * 2.6f, sp = sty.ItemSpacing.x;
+    int nb = 1 + (cfg.modsOn ? 1 : 0) + (cfg.logsOn ? 1 : 0);
+    float leftW = std::max(em * 6.f, full - (nb * sbw + (nb - 1) * sp) - sp);
+    {
+        ImVec2 p = ImGui::GetCursorScreenPos(); float h = em * .45f, pr = AnimK("prog", gProg.load(), 6.f); bool busy = gBusy;
+        dl->AddRectFilled(ImVec2(p.x, p.y + 2), ImVec2(p.x + leftW, p.y + 2 + h), ImGui::GetColorU32(ImVec4(gSoft.x, gSoft.y, gSoft.z, gSoft.w * .8f)), R(h / 2));
+        if (pr > 0.005f) {
+            dl->AddRectFilled(ImVec2(p.x, p.y + 2), ImVec2(p.x + leftW * pr, p.y + 2 + h), ImGui::GetColorU32(gAccent), R(h / 2));
+            if (busy) { float sh = fmodf(gTime * 0.8f, 1.f); float sx = p.x + (leftW * pr) * sh; dl->AddRectFilled(ImVec2(sx, p.y + 2), ImVec2(std::min(sx + em * 2, p.x + leftW * pr), p.y + 2 + h), IM_COL32(255, 255, 255, 70), R(h / 2)); }
+        }
+        std::string st; { std::lock_guard<std::mutex> l(gMu); st = gStatus; }
+        ImVec4 clip(p.x, p.y, p.x + leftW, p.y + rowH);
+        dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(p.x, p.y + h + em * .35f), TextCol(.85f), st.c_str(), nullptr, leftW, &clip);
+        ImGui::Dummy(ImVec2(leftW, rowH));
+    }
+    ImGui::SameLine(0, sp * 2);
+    if (cfg.logsOn) { if (FancyBtn(T("Лог", "Log"), ImVec2(sbw, em * 1.9f), gSoft)) Go(S_LOG); ImGui::SameLine(); }
+    if (FancyBtn(T("Папка", "Folder"), ImVec2(sbw, em * 1.9f), gSoft)) ImGui::OpenPopup("##folders");
+    {
+        ImVec2 fmin = ImGui::GetItemRectMin(), fmax = ImGui::GetItemRectMax();
+        ImGui::SetNextWindowPos(ImVec2(fmax.x, fmin.y - 4), 0, ImVec2(1, 1));
+        ImGui::SetNextWindowSize(ImVec2(em * 14, 0));
+        if (ImGui::BeginPopup("##folders")) {
+            fs::path gd = CurrentInstanceDir(); std::error_code ec;
+            if (ImGui::Selectable(T("Открыть папку игры", "Open game folder"))) Open(gd);
+            if (ImGui::Selectable(T("Открыть папку mods", "Open mods folder"))) Open(gd / "mods");
+            if (fs::exists(gd / "shaderpacks", ec) && ImGui::Selectable(T("Открыть папку shaderpacks", "Open shaderpacks folder"))) Open(gd / "shaderpacks");
+            ImGui::EndPopup();
+        }
+    }
+    if (cfg.modsOn) { ImGui::SameLine(); if (FancyBtn(T("Моды (бета)", "Mods (beta)"), ImVec2(sbw, em * 1.9f), gSoft)) Go(S_MODS); }
+
+    // нижний ряд: версия | ИГРАТЬ | аккаунт
+    float avail = ImGui::GetContentRegionAvail().x, bh = em * 2.8f, wl = (avail - 2 * sp) * 0.30f, wc = avail - 2 * sp - 2 * wl; bool busy = gBusy;
+    std::string vl = cfg.loader + "  " + (cfg.version.empty() ? std::string(T("загрузка...", "loading...")) : cfg.version);
+    if (FancyBtn(vl.c_str(), ImVec2(wl, bh), gSoft)) ImGui::OpenPopup("##vers");
+    {
+        ImVec2 bmin = ImGui::GetItemRectMin(), bmax = ImGui::GetItemRectMax();
+        ImGui::SetNextWindowPos(ImVec2(bmin.x, bmin.y - 4), 0, ImVec2(0, 1));
+        ImGui::SetNextWindowSize(ImVec2(std::max(bmax.x - bmin.x, em * 16.f), std::max(em * 8.f, std::min(em * 19.f, bmin.y - em))));
+        if (ImGui::BeginPopup("##vers")) {
+            const char* ld[] = {"Vanilla", "Fabric", "Forge"}; float sp2 = ImGui::GetStyle().ItemSpacing.x, bw = (ImGui::GetContentRegionAvail().x - 2 * sp2) / 3;
+            for (int i = 0; i < 3; i++) {
+                if (i) ImGui::SameLine();
+                bool sel = cfg.loader == ld[i];
+                if (FancyBtn(ld[i], ImVec2(bw, em * 1.9f), sel ? gAccent : gSoft) && !sel) {
+                    cfg.loader = ld[i];
+                    std::lock_guard<std::mutex> l(gVerMu); bool ok = false;
+                    for (auto& v : gVers) if (v.id == cfg.version && VerShown(v, cfg.loader)) ok = true;
+                    if (!ok) { // выбранной версии у этого загрузчика нет — берём самую новую подходящую
+                        for (auto& v : gVers) if (v.type == "release" && VerShown(v, cfg.loader)) { cfg.version = v.id; ok = true; break; }
+                        if (!ok) for (auto& v : gVers) if (VerShown(v, cfg.loader)) { cfg.version = v.id; break; }
+                    }
                 }
             }
-        }
-        ImGui::Separator();
-        ImGui::BeginChild("##vlist", ImVec2(0, 0), false);
-        {
-            std::lock_guard<std::mutex> l(gVerMu);
-            for (auto& v : gVers) {
-                if (!VerShown(v, cfg.loader)) continue;
-                std::string lab = v.id + (v.type == "snapshot" ? "   [снапшот]" : v.type == "old_beta" ? "   [бета]" : v.type == "old_alpha" ? "   [альфа]" : "");
-                bool s2 = v.id == cfg.version;
-                if (ImGui::Selectable(lab.c_str(), s2)) { cfg.version = v.id; ImGui::CloseCurrentPopup(); }
+            ImGui::Separator();
+            ImGui::BeginChild("##vlist", ImVec2(0, 0), false);
+            {
+                std::lock_guard<std::mutex> l(gVerMu);
+                for (auto& v : gVers) {
+                    if (!VerShown(v, cfg.loader)) continue;
+                    std::string lab = v.id + (v.type == "snapshot" ? T("   [снапшот]", "   [snapshot]") : v.type == "old_beta" ? T("   [бета]", "   [beta]") : v.type == "old_alpha" ? T("   [альфа]", "   [alpha]") : "");
+                    if (ImGui::Selectable(lab.c_str(), v.id == cfg.version)) { cfg.version = v.id; ImGui::CloseCurrentPopup(); }
+                }
             }
+            ImGui::EndChild();
+            ImGui::EndPopup();
+        }
+    }
+    ImGui::SameLine();
+    if (FancyBtn(busy ? T("Работаю...", "Working...") : T("ИГРАТЬ", "PLAY"), ImVec2(wc, bh), gAccent, !busy && !cfg.version.empty())) StartLaunch();
+    ImGui::SameLine();
+    std::string al = (cfg.sel >= 0 && cfg.sel < (int)cfg.accs.size()) ? cfg.accs[cfg.sel].name : std::string(T("Добавить аккаунт", "Add account"));
+    if (FancyBtn(al.c_str(), ImVec2(wl, bh), gSoft)) Go(S_ACC);
+}
+
+// ---------- Аккаунты ----------
+static void ScrAccounts() {
+    float em = ImGui::GetFontSize(); ImGuiStyle& sty = ImGui::GetStyle();
+    if (Header(T("Аккаунты", "Accounts"))) { Go(S_MAIN); return; }
+    float sp = sty.ItemSpacing.x, cw = (ImGui::GetContentRegionAvail().x - 2 * sp) / 3, ch = em * 17.5f, bh = em * 2.2f;
+    for (int i = 0; i < 3; i++) {
+        if (i) ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, gSoft); ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(em, em));
+        ImGui::BeginChild(i == 0 ? "c_ely" : i == 1 ? "c_off" : "c_ms", ImVec2(cw, ch), ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::PopStyleVar(); ImGui::PopStyleColor();
+        auto Title = [&](const char* s) { ImGui::SetWindowFontScale(1.3f); ImGui::TextColored(gAccent, "%s", s); ImGui::SetWindowFontScale(1.f); ImGui::Dummy(ImVec2(0, em * .1f)); };
+        auto Bul = [&](const char* s) { ImGui::PushTextWrapPos(0.f); ImGui::BulletText("%s", s); ImGui::PopTextWrapPos(); };
+        float by = ch - em - bh;
+        if (i == 0) { // Ely.by
+            Title("Ely.by");
+            Bul(T("Скины поддерживаются", "Skins supported")); Bul(T("Для пиратской версии", "For non-licensed copies")); Bul(T("Требуется интернет", "Internet required"));
+            ImGui::Dummy(ImVec2(0, em * .2f));
+            ImGui::SetNextItemWidth(-1); ImGui::InputTextWithHint("##eu", T("Логин или e-mail", "Login or e-mail"), bElyU, sizeof(bElyU));
+            ImGui::SetNextItemWidth(-1); ImGui::InputTextWithHint("##ep", T("Пароль (с 2FA: пароль:код)", "Password (with 2FA: password:code)"), bElyP, sizeof(bElyP), ImGuiInputTextFlags_Password);
+            ImGui::SetCursorPosY(by);
+            if (FancyBtn(T("Войти", "Sign in"), ImVec2(0, bh), gAccent, !gAuthBusy) && bElyU[0]) std::thread(ElyLoginThread, std::string(bElyU), std::string(bElyP)).detach();
+        } else if (i == 1) { // офлайн
+            Title(T("Офлайн", "Offline"));
+            Bul(T("Нет поддержки скинов", "No skin support")); Bul(T("Пиратка / лицензия", "Non-licensed / licensed")); Bul(T("Интернет не требуется", "No internet required"));
+            ImGui::Dummy(ImVec2(0, em * .2f));
+            ImGui::SetNextItemWidth(-1); ImGui::InputText("##nick", bNick, sizeof(bNick));
+            ImGui::PushTextWrapPos(0.f); ImGui::TextDisabled("%s", T(kNickHint, "Nick: 3-16 chars, Latin letters, digits and _")); ImGui::PopTextWrapPos();
+            ImGui::SetCursorPosY(by);
+            if (FancyBtn(T("Войти", "Sign in"), ImVec2(0, bh), gAccent) && AddOffline(bNick)) Go(S_MAIN);
+        } else { // Microsoft
+            Title("Microsoft");
+            Bul(T("Есть поддержка скинов", "Skins supported")); Bul(T("Лицензия", "Licensed copy")); Bul(T("Требуется интернет", "Internet required"));
+            ImGui::Dummy(ImVec2(0, em * .2f));
+            if (bMsId[0] == 0) { std::string id = MsId(); snprintf(bMsId, sizeof(bMsId), "%s", id.c_str()); }
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::InputTextWithHint("##msid", "Azure Client ID (portal.azure.com)", bMsId, sizeof(bMsId))) SetMsId(bMsId);
+            std::string code, uri; { std::lock_guard<std::mutex> l(gMu); code = gMsCode; uri = gMsUri; }
+            if (!code.empty()) {
+                ImGui::PushTextWrapPos(0.f); ImGui::TextWrapped(T("Открой %s и введи код:", "Open %s and enter the code:"), uri.c_str()); ImGui::PopTextWrapPos();
+                ImGui::SetWindowFontScale(1.4f); ImGui::TextColored(gAccent, "%s", code.c_str()); ImGui::SetWindowFontScale(1.f);
+                ImGui::SameLine(); if (ImGui::SmallButton(T("Копировать", "Copy"))) ImGui::SetClipboardText(code.c_str());
+            }
+            ImGui::SetCursorPosY(by);
+            if (FancyBtn(T("Войти", "Sign in"), ImVec2(0, bh), gAccent, !gAuthBusy)) { SetMsId(bMsId); SaveConfig(); std::thread(MsLoginThread).detach(); }
         }
         ImGui::EndChild();
-        ImGui::EndPopup();
     }
-    ImGui::TextDisabled("Аккаунт");
-    ImGui::Text("%s", cfg.sel >= 0 && cfg.sel < (int)cfg.accs.size() ? AccLabel(cfg.accs[cfg.sel]).c_str() : "Player (офлайн, будет создан)");
-    ImGui::Dummy(ImVec2(0, em * .4f));
-    bool busy = gBusy;
-    if (FancyBtn(busy ? "Работаю..." : "ИГРАТЬ", ImVec2(0, em * 2.8f), kAccent, !busy && !cfg.version.empty())) StartLaunch();
-    // прогресс
-    ImVec2 p = ImGui::GetCursorScreenPos(); float w = ImGui::GetContentRegionAvail().x, h = em * .45f;
-    float pr = AnimK("prog", gProg.load(), 6.f);
-    dl->AddRectFilled(ImVec2(p.x, p.y + 6), ImVec2(p.x + w, p.y + 6 + h), IM_COL32(255, 255, 255, 25), h / 2);
-    if (pr > 0.005f) {
-        dl->AddRectFilled(ImVec2(p.x, p.y + 6), ImVec2(p.x + w * pr, p.y + 6 + h), ImGui::GetColorU32(kAccent), h / 2);
-        if (busy) { float sh = fmodf(gTime * 0.8f, 1.f); float sx = p.x + (w * pr) * sh; dl->AddRectFilled(ImVec2(sx, p.y + 6), ImVec2(std::min(sx + em * 2, p.x + w * pr), p.y + 6 + h), IM_COL32(255, 255, 255, 70), h / 2); }
-    }
-    ImGui::Dummy(ImVec2(0, h + 12));
-    std::string st; { std::lock_guard<std::mutex> l(gMu); st = gStatus; }
-    ImGui::TextWrapped("%s", st.c_str());
-    ImGui::Dummy(ImVec2(0, em * .3f));
-    if (FancyBtn("Папка", ImVec2(0, em * 1.9f), ImVec4(1, 1, 1, 0.10f))) ImGui::OpenPopup("##folders");
-    ImVec2 fmin = ImGui::GetItemRectMin(), fmax = ImGui::GetItemRectMax();
-    ImGui::SetNextWindowPos(ImVec2(fmin.x, fmin.y - 4), 0, ImVec2(0, 1));
-    ImGui::SetNextWindowSize(ImVec2(fmax.x - fmin.x, 0));
-    if (ImGui::BeginPopup("##folders")) {
-        fs::path gd = CurrentInstanceDir(); std::error_code ec;
-        if (ImGui::Selectable("Открыть папку игры")) Open(gd);
-        if (ImGui::Selectable("Открыть папку mods")) Open(gd / "mods");
-        if (fs::exists(gd / "shaderpacks", ec) && ImGui::Selectable("Открыть папку shaderpacks")) Open(gd / "shaderpacks");
-        ImGui::EndPopup();
-    }
-}
-static void TabAccount() {
-    float em = ImGui::GetFontSize(); int del = -1;
-    ImGui::TextDisabled("Аккаунты");
+    TD(T("Сохранённые аккаунты", "Saved accounts"));
+    float listH = std::max(em * 3.f, ImGui::GetContentRegionAvail().y - em * 2.6f); int del = -1;
+    ImGui::BeginChild("accl", ImVec2(0, listH), 0, ImGuiWindowFlags_NoBackground);
     for (int i = 0; i < (int)cfg.accs.size(); i++) {
         ImGui::PushID(i);
         if (ImGui::Selectable(AccLabel(cfg.accs[i]).c_str(), cfg.sel == i, 0, ImVec2(ImGui::GetContentRegionAvail().x - em * 2.2f, 0))) cfg.sel = i;
         ImGui::SameLine(); if (ImGui::SmallButton("x")) del = i;
         ImGui::PopID();
     }
+    if (cfg.accs.empty()) TD(T("Пока нет ни одного аккаунта", "No accounts yet"));
+    ImGui::EndChild();
     if (del >= 0) { cfg.accs.erase(cfg.accs.begin() + del); if (cfg.accs.empty()) cfg.sel = -1; else if (cfg.sel == del) cfg.sel = 0; else if (cfg.sel > del) cfg.sel--; SaveConfig(); }
-    ImGui::Separator(); ImGui::TextDisabled("Офлайн");
-    ImGui::SetNextItemWidth(-1); ImGui::InputText("##nick", bNick, sizeof(bNick));
-    ImGui::TextDisabled("%s", kNickHint);
-    if (FancyBtn("Добавить офлайн-аккаунт", ImVec2(0, em * 1.9f), ImVec4(1, 1, 1, 0.12f))) AddOffline(bNick);
-    ImGui::Separator(); ImGui::TextDisabled("Ely.by");
-    ImGui::SetNextItemWidth(-1); ImGui::InputTextWithHint("##eu", "Логин или e-mail", bElyU, sizeof(bElyU));
-    ImGui::SetNextItemWidth(-1); ImGui::InputTextWithHint("##ep", "Пароль (с 2FA: пароль:код)", bElyP, sizeof(bElyP), ImGuiInputTextFlags_Password);
-    if (FancyBtn("Войти через Ely.by", ImVec2(0, em * 1.9f), ImVec4(1, 1, 1, 0.12f), !gAuthBusy) && bElyU[0]) std::thread(ElyLoginThread, std::string(bElyU), std::string(bElyP)).detach();
-    ImGui::Separator(); ImGui::TextDisabled("Microsoft");
-    if (bMsId[0] == 0) { std::string id = MsId(); snprintf(bMsId, sizeof(bMsId), "%s", id.c_str()); }
-    ImGui::SetNextItemWidth(-1);
-    if (ImGui::InputTextWithHint("##msid", "Azure Client ID (portal.azure.com)", bMsId, sizeof(bMsId))) SetMsId(bMsId);
-    if (FancyBtn("Войти через Microsoft", ImVec2(0, em * 1.9f), ImVec4(1, 1, 1, 0.12f), !gAuthBusy)) { SetMsId(bMsId); SaveConfig(); std::thread(MsLoginThread).detach(); }
-    std::string code, uri; { std::lock_guard<std::mutex> l(gMu); code = gMsCode; uri = gMsUri; }
-    if (!code.empty()) {
-        ImGui::TextWrapped("Открой %s и введи код:", uri.c_str());
-        ImGui::SetWindowFontScale(1.5f); ImGui::TextColored(kAccent, "%s", code.c_str()); ImGui::SetWindowFontScale(1.f);
-        if (ImGui::SmallButton("Скопировать код")) ImGui::SetClipboardText(code.c_str());
-    }
+    std::string st; { std::lock_guard<std::mutex> l(gMu); st = gStatus; }
+    ImGui::TextWrapped("%s", st.c_str());
 }
-static void TabSettings() {
-    float em = ImGui::GetFontSize();
-    ImGui::TextDisabled("Папка игры");
-    { std::string gd = PS(gRoot); ImGui::TextWrapped("%s", gd.c_str()); }
-    if (FancyBtn("Выбрать папку игры...", ImVec2(0, em * 1.9f), ImVec4(1, 1, 1, 0.12f), !gBusy)) {
-        std::string f = PickFolder(gHwnd); if (!f.empty()) { SetGameDir(f); ScanShots(); }
-    }
-    if (!cfg.gameDir.empty() && FancyBtn("Вернуть стандартную папку", ImVec2(0, em * 1.9f), ImVec4(1, 1, 1, 0.12f), !gBusy)) { SetGameDir(""); ScanShots(); }
-    ImGui::TextDisabled("После запуска игры");
-    ImGui::RadioButton("Оставить лаунчер как есть", &cfg.onLaunch, 0);
-    ImGui::RadioButton("Свернуть лаунчер", &cfg.onLaunch, 1);
-    ImGui::RadioButton("Закрыть лаунчер", &cfg.onLaunch, 2);
-    ImGui::TextDisabled("Показывать в списке версий");
-    ImGui::Checkbox("Снапшоты", &cfg.snapshots);
-    ImGui::Checkbox("Бета-версии (old_beta)", &cfg.showBeta);
-    ImGui::Checkbox("Альфа-версии (old_alpha)", &cfg.showAlpha);
-    ImGui::Separator();
-    ImGui::TextDisabled("Java");
-    static std::vector<JavaInfo> javas; static std::atomic<bool> scanning{false}; static std::mutex jm; static bool first = true;
-    if (first) { first = false; scanning = true; std::thread([] { auto j = FindJavas(); std::lock_guard<std::mutex> l(jm); javas = j; scanning = false; }).detach(); }
+
+// ---------- Моды ----------
+static void ScrMods() {
+    float em = ImGui::GetFontSize(); ImDrawList* dl = ImGui::GetWindowDrawList();
+    if (Header(T("Моды (бета)", "Mods (beta)"))) { Go(S_MAIN); return; }
+    std::string ld = LoaderId(cfg.loader);
+    std::string key = gWantQ + "|" + ld + "|" + cfg.version;
+    if (cfg.modSrc == 0 && !ld.empty() && !cfg.version.empty() && key != gModKey && !gModBusy) { gModKey = key; std::thread(ModSearchThread, gWantQ, ld, cfg.version).detach(); }
+    float total = ImGui::GetContentRegionAvail().x, lw = total * 0.34f;
+    ImGui::BeginChild("modsL", ImVec2(lw, 0), 0, ImGuiWindowFlags_NoBackground);
+    TD(T("Сайт для загрузки модов", "Mod download site")); ImGui::Text("%s", cfg.modSrc == 0 ? "Modrinth" : "CurseForge");
+    TD(T("Установка на", "Installing for")); ImGui::Text("%s  %s", cfg.loader.c_str(), cfg.version.c_str());
     ImGui::SetNextItemWidth(-1);
-    std::string cur = cfg.javaPath.empty() ? "Авто (подберу и скачаю сам)" : cfg.javaPath;
-    if (ImGui::BeginCombo("##java", cur.c_str())) {
-        if (ImGui::Selectable("Авто (подберу и скачаю сам)", cfg.javaPath.empty())) { cfg.javaPath.clear(); bJava[0] = 0; }
-        std::lock_guard<std::mutex> l(jm);
-        for (auto& j : javas) { std::string t = "Java " + std::to_string(j.major) + "  —  " + j.exe; if (ImGui::Selectable(t.c_str(), cfg.javaPath == j.exe)) { cfg.javaPath = j.exe; snprintf(bJava, sizeof(bJava), "%s", j.exe.c_str()); } }
-        ImGui::EndCombo();
+    bool go = ImGui::InputTextWithHint("##mq", T("Поиск...", "Search..."), bModQ, sizeof(bModQ), ImGuiInputTextFlags_EnterReturnsTrue);
+    if (FancyBtn(T("Найти", "Search"), ImVec2(0, em * 2.f), gSoft)) go = true;
+    if (go) { gWantQ = bModQ; gModKey.clear(); } // повторный поиск даже с тем же запросом
+    std::string msg; { std::lock_guard<std::mutex> l(gModMu); msg = gModMsg; }
+    if (cfg.modSrc == 1) msg = T("CurseForge пока недоступен (нужен API-ключ). Выбери Modrinth в Настройки > Общие.", "CurseForge is not available yet (API key needed). Pick Modrinth in Settings > General.");
+    else if (ld.empty()) msg = T("Для модов выбери загрузчик Fabric или Forge на главном экране.", "Pick the Fabric or Forge loader on the main screen to use mods.");
+    if (!msg.empty()) { ImGui::PushTextWrapPos(0.f); ImGui::TextColored(gAccent, "%s", msg.c_str()); ImGui::PopTextWrapPos(); }
+    ImGui::EndChild();
+    ImGui::SameLine();
+    ImGui::BeginChild("modsR", ImVec2(0, 0), 0, ImGuiWindowFlags_NoBackground);
+    if (cfg.modSrc == 0 && !ld.empty()) {
+        std::vector<ModHit> hits; std::set<std::string> done; { std::lock_guard<std::mutex> l(gModMu); hits = gModHits; done = gModDone; }
+        if (gModBusy && hits.empty()) TD(T("Загрузка...", "Loading..."));
+        bool inst = gModInst;
+        for (int i = 0; i < (int)hits.size(); i++) {
+            auto& h = hits[i]; ImGui::PushID(i);
+            ImVec2 p = ImGui::GetCursorScreenPos(); float w = ImGui::GetContentRegionAvail().x, bw = em * 8.5f, tw = std::max(em * 6.f, w - bw - em * 2.4f);
+            ImVec2 ds = ImGui::CalcTextSize(h.desc.c_str(), nullptr, false, tw); float dh = std::min(ds.y, em * 2.4f), rh = em * .7f + em * 1.3f + dh + em * .7f;
+            dl->AddRectFilled(p, ImVec2(p.x + w, p.y + rh), ImGui::GetColorU32(gSoft), R(em * .6f));
+            dl->AddText(ImVec2(p.x + em, p.y + em * .7f), TextCol(), h.title.c_str());
+            ImVec4 clip(p.x, p.y, p.x + em + tw, p.y + rh - em * .4f);
+            dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(p.x + em, p.y + em * .7f + em * 1.3f), TextCol(.65f), h.desc.c_str(), nullptr, tw, &clip);
+            bool d = done.count(h.id) > 0;
+            ImGui::SetCursorScreenPos(ImVec2(p.x + w - bw - em * .8f, p.y + (rh - em * 2.f) / 2));
+            if (FancyBtn(d ? T("Установлено", "Installed") : T("Установить", "Install"), ImVec2(bw, em * 2.f), d ? gSoft : gAccent, !inst && !d)) std::thread(ModInstallThread, h.id, h.title, ld, cfg.version).detach();
+            ImGui::SetCursorScreenPos(p); ImGui::Dummy(ImVec2(w, rh));
+            ImGui::PopID();
+        }
     }
-    ImGui::SetNextItemWidth(-1);
-    if (ImGui::InputTextWithHint("##jp", "...или свой путь к java.exe", bJava, sizeof(bJava))) cfg.javaPath = bJava;
-    ImGui::TextDisabled("Память (ОЗУ)");
-    MEMORYSTATUSEX ms{sizeof(ms)}; GlobalMemoryStatusEx(&ms); int maxMb = std::max(2048, (int)(ms.ullTotalPhys / (1024 * 1024) * 3 / 4));
-    ImGui::SetNextItemWidth(-1); ImGui::SliderInt("##ram", &cfg.ramMB, 1024, maxMb, "%d МБ"); cfg.ramMB = std::min(cfg.ramMB, maxMb);
-    ImGui::TextDisabled("Фон");
-    if (FancyBtn("Выбрать картинку...", ImVec2(0, em * 1.9f), ImVec4(1, 1, 1, 0.12f))) {
-        std::string f = PickImage(gHwnd); if (!f.empty()) { cfg.bg = f; cfg.slideshow = false; LoadBgAsync(f); }
-    }
-    if (FancyBtn("Фон из скриншотов Minecraft", ImVec2(0, em * 1.9f), ImVec4(1, 1, 1, 0.12f))) { ScanShots(); cfg.slideshow = true; NextShot(); }
-    ImGui::Checkbox("Слайдшоу фонов (каждые ~18 сек)", &cfg.slideshow);
-    ImGui::TextDisabled("Найдено скриншотов: %d", (int)gShots.size());
+    ImGui::EndChild();
 }
-static void TabLog() {
+
+static void ScrLog() {
+    if (Header(T("Лог", "Log"))) { Go(S_MAIN); return; }
     ImGui::BeginChild("log", ImVec2(0, 0), false);
     { std::lock_guard<std::mutex> l(gMu);
       ImGuiListClipper cl; cl.Begin((int)gLog.size());
       while (cl.Step()) for (int i = cl.DisplayStart; i < cl.DisplayEnd; i++) ImGui::TextUnformatted(gLog[i].c_str()); }
     if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4) ImGui::SetScrollHereY(1.f);
+    ImGui::EndChild();
+}
+
+// ---------- Настройки ----------
+static void ScrSettings() {
+    float em = ImGui::GetFontSize(); ImDrawList* dl = ImGui::GetWindowDrawList();
+    if (Header(T("Настройки", "Settings"))) { Go(S_MAIN); return; }
+    const char* labs[4] = {T("Общие", "General"), T("Кастомизация", "Customization"), T("Компоненты", "Components"), "Java"};
+    TabBar(labs, 4, gSetTab);
+    ImGui::BeginChild("setc", ImVec2(0, 0), 0, ImGuiWindowFlags_NoBackground);
+    if (gSetTab == 0) { // ---- Общие ----
+        TD(T("Папка игры", "Game folder"));
+        { std::string gd = PS(gRoot); ImGui::TextWrapped("%s", gd.c_str()); }
+        if (FancyBtn(T("Выбрать папку игры...", "Choose game folder..."), ImVec2(em * 14, em * 1.9f), gSoft, !gBusy)) { std::string f = PickFolder(gHwnd); if (!f.empty()) { SetGameDir(f); ScanShots(); } }
+        if (!cfg.gameDir.empty()) { ImGui::SameLine(); if (FancyBtn(T("Вернуть стандартную", "Reset to default"), ImVec2(em * 12, em * 1.9f), gSoft, !gBusy)) { SetGameDir(""); ScanShots(); } }
+        ImGui::Checkbox(T("Моды (бета)", "Mods (beta)"), &cfg.modsOn);
+        if (ImGui::Checkbox(T("Логи", "Logs"), &cfg.logsOn)) gLogOn = cfg.logsOn;
+        TD(T("Видеокарта", "Graphics card"));
+        { const char* it[] = {T("Авто (решает Windows)", "Auto (Windows decides)"), T("Использовать дискретную", "Use discrete GPU"), T("Использовать встроенную", "Use integrated GPU")};
+          int g = cfg.gpu == 2 ? 1 : cfg.gpu == 1 ? 2 : 0; if (ComboI("##gpu", g, it, 3)) cfg.gpu = g == 1 ? 2 : g == 2 ? 1 : 0; } // 0 авто, 1 встроенная, 2 дискретная
+        TD(T("Сайт для загрузки модов", "Mod download site"));
+        { const char* it[] = {"Modrinth", "CurseForge"}; ComboI("##src", cfg.modSrc, it, 2); }
+        if (FancyBtn(T("Проверка подключения к Modrinth", "Check Modrinth connection"), ImVec2(em * 19, em * 1.9f), gSoft, !gModChkBusy)) std::thread(ModrinthCheckThread).detach();
+        { std::string chk; { std::lock_guard<std::mutex> l(gModMu); chk = gModChk; } if (!chk.empty()) ImGui::TextColored(gAccent, "%s", chk.c_str()); }
+        TD(T("Язык лаунчера", "Launcher language"));
+        { const char* it[] = {"Русский", "English"}; ComboI("##lang", cfg.lang, it, 2); }
+        TD(T("После запуска игры", "After the game starts"));
+        ImGui::RadioButton(T("Оставить лаунчер как есть", "Leave the launcher as is"), &cfg.onLaunch, 0);
+        ImGui::RadioButton(T("Свернуть лаунчер", "Minimize the launcher"), &cfg.onLaunch, 1);
+        ImGui::RadioButton(T("Закрыть лаунчер", "Close the launcher"), &cfg.onLaunch, 2);
+        TD(T("Показывать в списке версий", "Show in the version list"));
+        ImGui::Checkbox(T("Снапшоты", "Snapshots"), &cfg.snapshots);
+        ImGui::Checkbox(T("Бета-версии (old_beta)", "Beta versions (old_beta)"), &cfg.showBeta);
+        ImGui::Checkbox(T("Альфа-версии (old_alpha)", "Alpha versions (old_alpha)"), &cfg.showAlpha);
+    } else if (gSetTab == 1) { // ---- Кастомизация ----
+        TD(T("Тема", "Theme"));
+        if (FancyBtn(T("Светлая", "Light"), ImVec2(em * 9, em * 2.f), cfg.light ? gAccent : gSoft)) cfg.light = true;
+        ImGui::SameLine(); if (FancyBtn(T("Тёмная", "Dark"), ImVec2(em * 9, em * 2.f), cfg.light ? gSoft : gAccent)) cfg.light = false;
+        TD(T("Цвет лаунчера", "Launcher color"));
+        for (int i = 0; i < 5; i++) {
+            ImGui::PushID(i); float d = em * 2.2f; ImVec2 p = ImGui::GetCursorScreenPos();
+            if (ImGui::InvisibleButton("##col", ImVec2(d, d))) cfg.color = i;
+            ImVec2 m(p.x + d / 2, p.y + d / 2);
+            dl->AddCircleFilled(m, d * .36f, ImGui::GetColorU32(kPalette[i]));
+            if (cfg.color == i) dl->AddCircle(m, d * .46f, TextCol(), 0, 2.f * gS);
+            ImGui::PopID(); if (i < 4) ImGui::SameLine();
+        }
+        ImGui::Checkbox(T("Закругление углов", "Rounded corners"), &cfg.rounded);
+        TD(T("Фон", "Background"));
+        if (FancyBtn(T("Загрузить", "Upload"), ImVec2(em * 11, em * 1.9f), gSoft)) { std::string f = PickImage(gHwnd); if (!f.empty()) { cfg.bg = f; cfg.slideshow = false; LoadBgAsync(f); } }
+        ImGui::SameLine(); if (FancyBtn(T("Скрины из майна", "Minecraft screenshots"), ImVec2(em * 14, em * 1.9f), gSoft)) { ScanShots(); cfg.slideshow = true; NextShot(); }
+        ImGui::Checkbox(T("Слайд-шоу (каждые ~18 сек)", "Slideshow (every ~18 s)"), &cfg.slideshow);
+        ImGui::TextDisabled(T("Найдено скриншотов: %d", "Screenshots found: %d"), (int)gShots.size());
+    } else if (gSetTab == 2) { // ---- Компоненты (Java) ----
+        static bool first = true; if (first) { first = false; RefreshJavas(); }
+        ImGui::TextColored(gAccent, "%s", T("Рекомендуется установить все Java!", "It is recommended to install all Java versions!"));
+        std::vector<JavaInfo> js; { std::lock_guard<std::mutex> l(gJavaMu); js = gJavas; }
+        int inst = gJavaInst;
+        for (int v : kJavaVers) {
+            bool have = false; for (auto& j : js) if (j.major == v) have = true;
+            float bh = em * 2.f; ImVec2 p = ImGui::GetCursorScreenPos();
+            std::string nm = "Java " + std::to_string(v); dl->AddText(ImVec2(p.x, p.y + (bh - em) / 2), TextCol(), nm.c_str());
+            ImGui::Dummy(ImVec2(em * 6.f, bh)); ImGui::SameLine();
+            ImGui::PushID(v);
+            if (FancyBtn(have ? T("Установлено", "Installed") : (inst == v ? T("Установка...", "Installing...") : T("Установить", "Install")), ImVec2(em * 10, bh), have ? gSoft : gAccent, !have && !inst)) std::thread(JavaInstallThread, v).detach();
+            ImGui::PopID();
+            ImGui::SameLine(); ImVec2 q = ImGui::GetCursorScreenPos(); ImGui::Dummy(ImVec2(em * 2.f, bh));
+            ImVec2 m(q.x + em, q.y + bh / 2);
+            if (have) IconCheck(dl, m, em * .5f, ImGui::GetColorU32(ImVec4(.30f, .78f, .38f, 1.f))); else IconCross(dl, m, em * .5f, ImGui::GetColorU32(ImVec4(.92f, .32f, .32f, 1.f)));
+        }
+        if (gJavaScan) TD(T("Проверяю установленные Java...", "Scanning installed Java..."));
+    } else { // ---- Java ----
+        TD("Java");
+        static bool first = true; if (first) { first = false; RefreshJavas(); }
+        ImGui::SetNextItemWidth(-1);
+        std::string cur = cfg.javaPath.empty() ? std::string(T("Авто (подберу и скачаю сам)", "Auto (pick and download automatically)")) : cfg.javaPath;
+        if (ImGui::BeginCombo("##java", cur.c_str())) {
+            if (ImGui::Selectable(T("Авто (подберу и скачаю сам)", "Auto (pick and download automatically)"), cfg.javaPath.empty())) { cfg.javaPath.clear(); bJava[0] = 0; }
+            std::lock_guard<std::mutex> l(gJavaMu);
+            for (auto& j : gJavas) { std::string t = "Java " + std::to_string(j.major) + "  -  " + j.exe; if (ImGui::Selectable(t.c_str(), cfg.javaPath == j.exe)) { cfg.javaPath = j.exe; snprintf(bJava, sizeof(bJava), "%s", j.exe.c_str()); } }
+            ImGui::EndCombo();
+        }
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputTextWithHint("##jp", T("...или свой путь к java.exe", "...or your own path to java.exe"), bJava, sizeof(bJava))) cfg.javaPath = bJava;
+        TD(T("Аргументы Java", "Java arguments"));
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputTextWithHint("##jvm", "-XX:+UseZGC -Dfile.encoding=UTF-8", bJvm, sizeof(bJvm))) cfg.jvmArgs = bJvm;
+        TD(T("Добавляются после стандартных (-Xmx, G1GC)", "Appended after the defaults (-Xmx, G1GC)"));
+        TD(T("Память (ОЗУ)", "Memory (RAM)"));
+        MEMORYSTATUSEX ms{sizeof(ms)}; GlobalMemoryStatusEx(&ms); int maxMb = std::max(2048, (int)(ms.ullTotalPhys / (1024 * 1024) * 3 / 4));
+        ImGui::SetNextItemWidth(-1); ImGui::SliderInt("##ram", &cfg.ramMB, 1024, maxMb, T("%d МБ", "%d MB")); cfg.ramMB = std::min(cfg.ramMB, maxMb);
+    }
     ImGui::EndChild();
 }
 static void DrawCover(ImDrawList* dl, const Tex& t, float alpha, ImVec2 sz) {
@@ -1102,28 +1482,26 @@ static void DrawUI(float W, float H) {
         auto C = [&](float o) { return IM_COL32((int)(30 + 25 * sinf(t + o)), (int)(55 + 30 * sinf(t + o + 2)), (int)(90 + 40 * sinf(t + o + 4)), 255); };
         bg->AddRectFilledMultiColor(ImVec2(0, 0), sz, C(0), C(1.5f), C(3.f), C(4.5f));
     } else { if (gBg[1].v && gFade < 1.f) DrawCover(bg, gBg[1], 1.f, sz); DrawCover(bg, gBg[0], gFade, sz); }
-    bg->AddRectFilledMultiColor(ImVec2(0, 0), sz, IM_COL32(0, 0, 0, 120), IM_COL32(0, 0, 0, 20), IM_COL32(0, 0, 0, 20), IM_COL32(0, 0, 0, 120));
+    if (cfg.light) bg->AddRectFilledMultiColor(ImVec2(0, 0), sz, IM_COL32(255, 255, 255, 110), IM_COL32(255, 255, 255, 30), IM_COL32(255, 255, 255, 30), IM_COL32(255, 255, 255, 110));
+    else bg->AddRectFilledMultiColor(ImVec2(0, 0), sz, IM_COL32(0, 0, 0, 120), IM_COL32(0, 0, 0, 20), IM_COL32(0, 0, 0, 20), IM_COL32(0, 0, 0, 120));
 
     ImGui::SetNextWindowPos(ImVec2(0, 0)); ImGui::SetNextWindowSize(sz);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0)); ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
     ImGui::Begin("root", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
     ImGui::PopStyleVar(2);
     float em = ImGui::GetFontSize(), intro = AnimK("intro", 1.f, 2.5f);
-    float pw = std::min(em * 21, W - em * 2), px = em * 1.5f - (1 - intro) * em * 3, py = em * 1.5f, ph = H - em * 3;
+    float pw = W - em * 2.4f, px = em * 1.2f - (1 - intro) * em * 3, py = em * 1.2f, ph = H - em * 2.4f;
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph), IM_COL32(14, 17, 26, (int)(190 * intro)), em * .9f);
-    dl->AddRect(ImVec2(px, py), ImVec2(px + pw, py + ph), IM_COL32(255, 255, 255, (int)(30 * intro)), em * .9f);
+    dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph), cfg.light ? IM_COL32(246, 248, 252, (int)(228 * intro)) : IM_COL32(14, 17, 26, (int)(190 * intro)), R(em * .9f));
+    dl->AddRect(ImVec2(px, py), ImVec2(px + pw, py + ph), cfg.light ? IM_COL32(0, 0, 0, (int)(40 * intro)) : IM_COL32(255, 255, 255, (int)(30 * intro)), R(em * .9f));
     ImGui::SetCursorPos(ImVec2(px + em, py + em));
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, intro);
     ImGui::BeginChild("panel", ImVec2(pw - em * 2, ph - em * 2), false, ImGuiWindowFlags_NoBackground);
-    ImGui::SetWindowFontScale(1.5f); ImGui::TextColored(kAccent, "PoltergeistLauncher"); ImGui::SetWindowFontScale(1.f);
-    ImGui::Dummy(ImVec2(0, em * .2f));
-    TabBar();
-    gTabFade = std::min(1.f, gTabFade + ImGui::GetIO().DeltaTime * 7.f);
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (1 - gTabFade) * em * .8f);
-    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, intro * gTabFade);
+    gScrFade = std::min(1.f, gScrFade + ImGui::GetIO().DeltaTime * 7.f);
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (1 - gScrFade) * em * .8f);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, intro * gScrFade);
     ImGui::BeginChild("content", ImVec2(0, 0), false, ImGuiWindowFlags_NoBackground);
-    if (gTab == 0) TabGame(); else if (gTab == 1) TabAccount(); else if (gTab == 2) TabSettings(); else TabLog();
+    switch (gScr) { case S_ACC: ScrAccounts(); break; case S_MODS: ScrMods(); break; case S_SET: ScrSettings(); break; case S_LOG: ScrLog(); break; default: ScrMain(); }
     ImGui::EndChild();
     ImGui::PopStyleVar();
     ImGui::EndChild();
@@ -1131,14 +1509,15 @@ static void DrawUI(float W, float H) {
 
     // окно с объяснением краша
     static std::string cT, cB;
-    { std::lock_guard<std::mutex> l(gMu); if (gShowCrash) { gShowCrash = false; cT = gCrashTitle; cB = gCrashBody; ImGui::OpenPopup("Что-то пошло не так"); } }
+    std::string popId = std::string(T("Что-то пошло не так", "Something went wrong")) + "###crash";
+    { std::lock_guard<std::mutex> l(gMu); if (gShowCrash) { gShowCrash = false; cT = gCrashTitle; cB = gCrashBody; ImGui::OpenPopup("###crash"); } }
     ImGui::SetNextWindowPos(ImVec2(W / 2, H / 2), ImGuiCond_Always, ImVec2(.5f, .5f));
     ImGui::SetNextWindowSize(ImVec2(std::min(em * 30, W - em * 2), 0));
-    if (ImGui::BeginPopupModal("Что-то пошло не так", nullptr, ImGuiWindowFlags_NoResize)) {
+    if (ImGui::BeginPopupModal(popId.c_str(), nullptr, ImGuiWindowFlags_NoResize)) {
         ImGui::SetWindowFontScale(1.25f); ImGui::TextColored(ImVec4(1.f, .45f, .4f, 1.f), "%s", cT.c_str()); ImGui::SetWindowFontScale(1.f);
         ImGui::Separator(); ImGui::TextWrapped("%s", cB.c_str()); ImGui::Dummy(ImVec2(0, em * .5f));
-        if (ImGui::Button("Показать лог", ImVec2(em * 8, 0))) { gTab = 3; gTabFade = 0; ImGui::CloseCurrentPopup(); }
-        ImGui::SameLine(); if (ImGui::Button("Закрыть", ImVec2(em * 8, 0))) ImGui::CloseCurrentPopup();
+        if (cfg.logsOn) { if (ImGui::Button(T("Показать лог", "Show log"), ImVec2(em * 8, 0))) { Go(S_LOG); ImGui::CloseCurrentPopup(); } ImGui::SameLine(); }
+        if (ImGui::Button(T("Закрыть", "Close"), ImVec2(em * 8, 0))) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
     ImGui::End();
@@ -1153,6 +1532,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_SIZE:
         if (gDev && w != SIZE_MINIMIZED) { if (gRTV) { gRTV->Release(); gRTV = nullptr; } gSwap->ResizeBuffers(0, LOWORD(l), HIWORD(l), DXGI_FORMAT_UNKNOWN, 0); CreateRTV(); }
         return 0;
+    case WM_GETMINMAXINFO: { MINMAXINFO* mm = (MINMAXINFO*)l; mm->ptMinTrackSize.x = (LONG)(900 * gS); mm->ptMinTrackSize.y = (LONG)(600 * gS); return 0; }
     case WM_SYSCOMMAND: if ((w & 0xfff0) == SC_KEYMENU) return 0; break;
     case WM_DESTROY: PostQuitMessage(0); return 0;
     }
@@ -1160,7 +1540,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int) {
     ImGui_ImplWin32_EnableDpiAwareness();
-    float S = ImGui_ImplWin32_GetDpiScaleForMonitor(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY));
+    float S = ImGui_ImplWin32_GetDpiScaleForMonitor(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY)); gS = S;
     gCfgDir = fs::path(Env(L"APPDATA")) / ".mclauncher"; gRoot = gCfgDir;
     std::error_code ec; fs::create_directories(gCfgDir, ec);
     WNDCLASSEXW wc{sizeof(wc), CS_CLASSDC, WndProc, 0, 0, hi, nullptr, LoadCursor(nullptr, IDC_ARROW), nullptr, nullptr, L"MCL", nullptr};
@@ -1187,17 +1567,9 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int) {
             if (fs::exists(P(f)) && io.Fonts->AddFontFromFileTTF(f.c_str(), 18.f * S, nullptr, io.Fonts->GetGlyphRangesCyrillic())) { ok = true; break; }
         if (!ok) io.Fonts->AddFontDefault(); // без кириллицы: будут «?»
     }
-    ImGui::StyleColorsDark(); ImGuiStyle& st = ImGui::GetStyle();
-    st.FrameRounding = 8; st.PopupRounding = 10; st.GrabRounding = 8; st.ScrollbarRounding = 8; st.WindowRounding = 12; st.ChildRounding = 8;
-    st.FramePadding = ImVec2(10, 7); st.ItemSpacing = ImVec2(10, 10); st.ScaleAllSizes(S);
-    ImVec4* c = st.Colors;
-    c[ImGuiCol_FrameBg] = ImVec4(1, 1, 1, .08f); c[ImGuiCol_FrameBgHovered] = ImVec4(1, 1, 1, .14f); c[ImGuiCol_FrameBgActive] = ImVec4(1, 1, 1, .18f);
-    c[ImGuiCol_CheckMark] = kAccent; c[ImGuiCol_SliderGrab] = kAccent; c[ImGuiCol_SliderGrabActive] = kAccent;
-    c[ImGuiCol_Header] = ImVec4(kAccent.x, kAccent.y, kAccent.z, .35f); c[ImGuiCol_HeaderHovered] = ImVec4(kAccent.x, kAccent.y, kAccent.z, .5f);
-    c[ImGuiCol_PopupBg] = ImVec4(.08f, .09f, .13f, .98f);
     ImGui_ImplWin32_Init(gHwnd); ImGui_ImplDX11_Init(gDev, gCtx);
 
-    LoadConfig(); snprintf(bJava, sizeof(bJava), "%s", cfg.javaPath.c_str());
+    LoadConfig(); snprintf(bJava, sizeof(bJava), "%s", cfg.javaPath.c_str()); snprintf(bJvm, sizeof(bJvm), "%s", cfg.jvmArgs.c_str()); gLogOn = cfg.logsOn;
     if (!cfg.gameDir.empty()) { // своя папка игры из настроек
         std::error_code e2; fs::create_directories(P(cfg.gameDir), e2);
         if (!e2 && fs::is_directory(P(cfg.gameDir), e2)) gRoot = P(cfg.gameDir); else cfg.gameDir.clear();
@@ -1222,6 +1594,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int) {
         { std::lock_guard<std::mutex> l(gVerMu); if (cfg.version.empty() && !gLatest.empty()) cfg.version = gLatest; }
         UpdateBackground(dt);
 
+        { int sg = (cfg.light ? 1 : 0) | (std::clamp(cfg.color, 0, 4) << 1) | (cfg.rounded ? 16 : 0); if (sg != gThemeSig) { gThemeSig = sg; ApplyTheme(); } }
         ImGui_ImplDX11_NewFrame(); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame();
         RECT rc; GetClientRect(gHwnd, &rc);
         DrawUI((float)(rc.right - rc.left), (float)(rc.bottom - rc.top));
