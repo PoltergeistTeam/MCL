@@ -43,7 +43,7 @@
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
-static const char* kVer = "0.0.3";
+static const char* kVer = "0.0.4";
 
 // ====== Настройка: Azure Client ID для входа через Microsoft (см. объяснение в ответе) ======
 static const std::string kMsClientId = ""; // можно оставить пустым: ID вводится в приложении (вкладка «Аккаунт») и сохраняется в config.json
@@ -145,8 +145,8 @@ static Resp Http(const std::string& url, const std::string& method = "GET", cons
     if (!WinHttpCrackUrl(w.c_str(), 0, 0, &uc)) return r;
     std::wstring host(uc.lpszHostName, uc.dwHostNameLength), path(uc.lpszUrlPath, uc.dwUrlPathLength + uc.dwExtraInfoLength);
     static HINTERNET ses = [] {
-        HINTERNET h = WinHttpOpen(L"PoltergeistLauncher/0.0.3 (github.com/PoltergeistTeam/MCL)", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, 0, 0, 0);
-        if (!h) h = WinHttpOpen(L"PoltergeistLauncher/0.0.3 (github.com/PoltergeistTeam/MCL)", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, 0, 0, 0); // старые Windows (до 8.1)
+        HINTERNET h = WinHttpOpen(L"PoltergeistLauncher/0.0.4 (github.com/PoltergeistTeam/MCL)", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, 0, 0, 0);
+        if (!h) h = WinHttpOpen(L"PoltergeistLauncher/0.0.4 (github.com/PoltergeistTeam/MCL)", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, 0, 0, 0); // старые Windows (до 8.1)
         return h;
     }();
     HINTERNET con = WinHttpConnect(ses, host.c_str(), uc.nPort, 0);
@@ -727,6 +727,11 @@ static void SetGameDir(const std::string& d) { // пустая строка = с
 }
 
 // ============================ Запуск игры ============================
+static std::string InstId(const std::string& loader, const std::string& mc) { // имя папки экземпляра: игра, моды и меню «Экземпляры» используют одно и то же
+    if (loader == "Fabric" || loader == "fabric") return mc + "-fabric";
+    if (loader == "Forge" || loader == "forge") return mc + "-forge";
+    return mc;
+}
 static void LaunchThread(Config c, Account acc) {
     gBusy = true; gProg = 0;
     try {
@@ -749,7 +754,7 @@ static void LaunchThread(Config c, Account acc) {
         int need2 = lv.contains("javaVersion") ? lv["javaVersion"].value("majorVersion", 8) : 8;
         std::string java = c.javaPath.empty() ? EnsureJava(need2) : javaPick;
         if (java.empty()) throw std::runtime_error("Java не найдена");
-        fs::path gameDir = gRoot / "instances" / P(launchId);
+        fs::path gameDir = gRoot / "instances" / P(InstId(c.loader, c.version));
         std::error_code ec; fs::create_directories(gameDir, ec);
         Prep pp; Prepare(lv, launchId, gameDir, pp);
 
@@ -901,9 +906,10 @@ static std::string PickImage(HWND hw) {
 }
 
 // ============================ UI ============================
-enum { S_MAIN, S_ACC, S_MODS, S_SET, S_LOG };
+enum { S_MAIN, S_ACC, S_MODS, S_SET, S_LOG, S_INST };
 static int gScr = S_MAIN, gSetTab = 0; static float gScrFade = 1;
-static void Go(int s) { if (gScr != s) { gScr = s; gScrFade = 0; } }
+static bool gInstDirty = true; static float gTitleH = 0, gCtrlX = 1e9f; // верхняя полоса окна: зона перетаскивания и начало кнопок
+static void Go(int s) { if (gScr != s) { gScr = s; gScrFade = 0; if (s == S_INST) gInstDirty = true; } }
 static float gS = 1.f; static int gThemeSig = -1;
 static ImVec4 gAccent(0.33f, 0.78f, 0.40f, 1.f), gSoft(1.f, 1.f, 1.f, 0.12f);
 static const ImVec4 kPalette[5] = {ImVec4(0.26f, 0.52f, 0.96f, 1.f), ImVec4(0.33f, 0.78f, 0.40f, 1.f), ImVec4(0.92f, 0.30f, 0.30f, 1.f),
@@ -1013,17 +1019,7 @@ static bool VerShown(const Ver& v, const std::string& loader) { // вызыва�
     return true;
 }
 static fs::path CurrentInstanceDir() { // папка игры для выбранных загрузчика и версии
-    std::string id = cfg.version; std::error_code ec;
-    auto find = [&](const std::string& pre, const std::string& suf) -> std::string {
-        for (auto& e : fs::directory_iterator(gRoot / "instances", ec)) {
-            std::string n = U8(e.path().filename().wstring());
-            if (n.rfind(pre, 0) == 0 && n.size() >= suf.size() && n.compare(n.size() - suf.size(), suf.size(), suf) == 0) return n;
-        }
-        return std::string();
-    };
-    if (cfg.loader == "Fabric") { std::string n = find("fabric-loader-", "-" + cfg.version); if (!n.empty()) id = n; }
-    else if (cfg.loader == "Forge") { std::string n = find(cfg.version + "-forge-", ""); if (!n.empty()) id = n; }
-    return gRoot / "instances" / P(id);
+    return gRoot / "instances" / P(InstId(cfg.loader, cfg.version));
 }
 
 // ---------- Java: список установленных и установка ----------
@@ -1091,26 +1087,10 @@ static bool InstallModRec(const std::string& pid, const std::string& loader, con
         }
     return true;
 }
-static fs::path ResolveInstanceDir(const std::string& loader, const std::string& mc) { // та же папка, в которую потом запустится игра
-    std::string id = mc;
-    try {
-        if (loader == "Fabric") { std::string have = InstallFabric(mc); if (!have.empty()) id = have; }
-        else if (loader == "Forge") {
-            std::string fv; Resp r = Http("https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json"); json j = Parse(r.body);
-            if (j.is_object() && j.contains("promos")) {
-                auto& pr = j["promos"];
-                if (pr.contains(mc + "-recommended")) fv = pr[mc + "-recommended"].get<std::string>();
-                else if (pr.contains(mc + "-latest")) fv = pr[mc + "-latest"].get<std::string>();
-            }
-            std::string have = fv.empty() ? FindInstalled(mc + "-forge-", "") : mc + "-forge-" + fv; if (!have.empty()) id = have;
-        }
-    } catch (...) {}
-    return gRoot / "instances" / P(id);
-}
 static void ModInstallThread(std::string pid, std::string title, std::string loader, std::string mc) {
     gModInst = true;
     try {
-        fs::path dir = ResolveInstanceDir(loader, mc) / "mods"; std::set<std::string> seen;
+        fs::path dir = gRoot / "instances" / P(InstId(loader, mc)) / "mods"; std::set<std::string> seen;
         if (InstallModRec(pid, loader, mc, dir, seen, 0)) { { std::lock_guard<std::mutex> l(gModMu); gModDone.insert(pid); } ModMsg(std::string(T("Установлено: ", "Installed: ")) + title); }
         else ModMsg(cfg.lang == 1 ? "No versions of \"" + title + "\" for " + loader + " " + mc : "Для мода «" + title + "» нет версий под " + loader + " " + mc);
     } catch (std::exception& e) { ModMsg(std::string(T("Ошибка: ", "Error: ")) + e.what()); }
@@ -1128,11 +1108,14 @@ static void ModrinthCheckThread() {
 
 // ---------- Новости ----------
 struct NewsItem { const char* ver; const char* ru; const char* en; };
-static const NewsItem kNews[] = { // новые сверху
+static const std::vector<NewsItem> kNews = { // новые сверху
+    {"v0.0.4", "Добавлены некоторые настройки.", "Some settings added."},
     {"v0.0.3", "Добавлено больше настроек. И моды.", "More settings added. And mods."},
     {"v0.0.2", "Hotfix Java. Скачивалась не та версия для 26.1-26.3.", "Java hotfix. The wrong Java version was downloaded for 26.1-26.3."},
     {"v0.0.1", "Добро пожаловать в ОБТ PoltergeistLauncher. Пока контента мало, с обновлениями будем добавлять его.", "Welcome to the PoltergeistLauncher open beta. There is little content for now, we will add more with updates."},
 };
+static const std::vector<NewsItem> kGameNews = {}; // новости игры: пока пусто
+static int gNewsTab = 0;
 
 static bool Header(const char* title) { // заголовок экрана + стрелка «назад» справа; true = нажали «назад»
     float em = ImGui::GetFontSize(); ImVec2 st = ImGui::GetCursorPos(); float w = ImGui::GetContentRegionAvail().x, bh = em * 2.2f, bw = em * 3.4f;
@@ -1164,13 +1147,17 @@ static void ScrMain() {
         if (FancyBtn(T("Настройки", "Settings"), ImVec2(bw, bh), gSoft)) Go(S_SET);
         ImGui::SetCursorPos(ImVec2(st.x, st.y + bh + em * .8f));
     }
-    { // «Новости» по центру
-        ImGui::SetWindowFontScale(1.25f); const char* nt = T("Новости", "News"); float tw = ImGui::CalcTextSize(nt).x;
-        ImGui::SetCursorPosX((ImGui::GetWindowWidth() - tw) / 2); ImGui::TextUnformatted(nt); ImGui::SetWindowFontScale(1.f);
+    { // вкладки: новости лаунчера / новости игры, по центру
+        const char* nl[2] = {T("Новости лаунчера", "Launcher news"), T("Новости игры", "Game news")};
+        float tw = 0; for (auto l : nl) tw += ImGui::CalcTextSize(l).x + em * 1.2f;
+        ImGui::SetCursorPosX(std::max(0.f, (ImGui::GetWindowWidth() - tw) / 2));
+        ImGui::PushID("newstabs"); TabBar(nl, 2, gNewsTab); ImGui::PopID();
     }
     float bottomH = em * 6.3f + sty.ItemSpacing.y * 3;
     ImGui::BeginChild("news", ImVec2(0, std::max(em * 4.f, ImGui::GetContentRegionAvail().y - bottomH)), 0, ImGuiWindowFlags_NoBackground);
-    for (auto& n : kNews) {
+    const std::vector<NewsItem>& ns = gNewsTab == 0 ? kNews : kGameNews;
+    if (ns.empty()) TD(T("Пока пусто", "Nothing here yet"));
+    for (auto& n : ns) {
         float aw = ImGui::GetContentRegionAvail().x, cw = std::min(aw, em * 42.f); ImVec2 p = ImGui::GetCursorScreenPos(); float x0 = p.x + (aw - cw) / 2;
         float tw = cw - em * 2; const char* txt = T(n.ru, n.en); ImVec2 ts = ImGui::CalcTextSize(txt, nullptr, false, tw);
         float ch = em * .8f + em * 1.4f + ts.y + em * .8f;
@@ -1183,10 +1170,12 @@ static void ScrMain() {
 
     // строка статуса + прогресс слева, мелкие кнопки справа
     float full = ImGui::GetContentRegionAvail().x, sbw = em * 5.4f, rowH = em * 2.6f, sp = sty.ItemSpacing.x;
-    int nb = 1 + (cfg.modsOn ? 1 : 0) + (cfg.logsOn ? 1 : 0);
-    float leftW = std::max(em * 6.f, full - (nb * sbw + (nb - 1) * sp) - sp);
+    { const char* sbl[4] = {T("Лог", "Log"), T("Папка", "Folder"), T("Моды (бета)", "Mods (beta)"), T("Экземпляры", "Instances")};
+      for (auto l : sbl) sbw = std::max(sbw, ImGui::CalcTextSize(l).x + em * 1.6f); } // кнопки по ширине текста
+    int nb = 2 + (cfg.modsOn ? 1 : 0) + (cfg.logsOn ? 1 : 0);
+    float leftW = std::max(em * 6.f, full - (nb * sbw + (nb - 1) * sp) - sp * 2); // sp*2 — зазор из SameLine ниже
     {
-        ImVec2 p = ImGui::GetCursorScreenPos(); float h = em * .45f, pr = AnimK("prog", gProg.load(), 6.f); bool busy = gBusy;
+        ImVec2 p = ImGui::GetCursorScreenPos(); float h = em * .28f, pr = AnimK("prog", gProg.load(), 6.f); bool busy = gBusy;
         dl->AddRectFilled(ImVec2(p.x, p.y + 2), ImVec2(p.x + leftW, p.y + 2 + h), ImGui::GetColorU32(ImVec4(gSoft.x, gSoft.y, gSoft.z, gSoft.w * .8f)), R(h / 2));
         if (pr > 0.005f) {
             dl->AddRectFilled(ImVec2(p.x, p.y + 2), ImVec2(p.x + leftW * pr, p.y + 2 + h), ImGui::GetColorU32(gAccent), R(h / 2));
@@ -1194,7 +1183,7 @@ static void ScrMain() {
         }
         std::string st; { std::lock_guard<std::mutex> l(gMu); st = gStatus; }
         ImVec4 clip(p.x, p.y, p.x + leftW, p.y + rowH);
-        dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(p.x, p.y + h + em * .35f), TextCol(.85f), st.c_str(), nullptr, leftW, &clip);
+        if (gScr == S_MAIN) dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(p.x, p.y + h + em * .35f), TextCol(.85f * ImGui::GetStyle().Alpha), st.c_str(), nullptr, leftW, &clip); // только на главном экране и с общей прозрачностью экрана
         ImGui::Dummy(ImVec2(leftW, rowH));
     }
     ImGui::SameLine(0, sp * 2);
@@ -1213,6 +1202,7 @@ static void ScrMain() {
         }
     }
     if (cfg.modsOn) { ImGui::SameLine(); if (FancyBtn(T("Моды (бета)", "Mods (beta)"), ImVec2(sbw, em * 1.9f), gSoft)) Go(S_MODS); }
+    ImGui::SameLine(); if (FancyBtn(T("Экземпляры", "Instances"), ImVec2(sbw, em * 1.9f), gSoft)) Go(S_INST);
 
     // нижний ряд: версия | ИГРАТЬ | аккаунт
     float avail = ImGui::GetContentRegionAvail().x, bh = em * 2.8f, wl = (avail - 2 * sp) * 0.30f, wc = avail - 2 * sp - 2 * wl; bool busy = gBusy;
@@ -1306,7 +1296,7 @@ static void ScrAccounts() {
         ImGui::EndChild();
     }
     TD(T("Сохранённые аккаунты", "Saved accounts"));
-    float listH = std::max(em * 3.f, ImGui::GetContentRegionAvail().y - em * 2.6f); int del = -1;
+    float listH = std::max(em * 3.f, ImGui::GetContentRegionAvail().y); int del = -1;
     ImGui::BeginChild("accl", ImVec2(0, listH), 0, ImGuiWindowFlags_NoBackground);
     for (int i = 0; i < (int)cfg.accs.size(); i++) {
         ImGui::PushID(i);
@@ -1317,8 +1307,6 @@ static void ScrAccounts() {
     if (cfg.accs.empty()) TD(T("Пока нет ни одного аккаунта", "No accounts yet"));
     ImGui::EndChild();
     if (del >= 0) { cfg.accs.erase(cfg.accs.begin() + del); if (cfg.accs.empty()) cfg.sel = -1; else if (cfg.sel == del) cfg.sel = 0; else if (cfg.sel > del) cfg.sel--; SaveConfig(); }
-    std::string st; { std::lock_guard<std::mutex> l(gMu); st = gStatus; }
-    ImGui::TextWrapped("%s", st.c_str());
 }
 
 // ---------- Моды ----------
@@ -1363,6 +1351,95 @@ static void ScrMods() {
         }
     }
     ImGui::EndChild();
+}
+
+// ---------- Экземпляры ----------
+struct InstInfo { std::string dir, loader, mc; };
+static std::vector<InstInfo> gInsts; static int gInstCtx = -1, gInstModal = 0;
+struct InstStat { bool client = false, profile = false; int mods = 0; long long size = 0; std::string path; };
+static InstStat gInstSt;
+static InstInfo ParseInst(const std::string& n) {
+    InstInfo r; r.dir = n; r.loader = "Vanilla"; r.mc = n;
+    auto ends = [&](const std::string& x) { return n.size() > x.size() && n.compare(n.size() - x.size(), x.size(), x) == 0; };
+    if (ends("-fabric")) { r.loader = "Fabric"; r.mc = n.substr(0, n.size() - 7); }
+    else if (ends("-forge")) { r.loader = "Forge"; r.mc = n.substr(0, n.size() - 6); }
+    else if (n.rfind("fabric-loader-", 0) == 0) { size_t k = n.find('-', 14); r.loader = "Fabric"; if (k != std::string::npos) r.mc = n.substr(k + 1); } // старые папки
+    else { size_t k = n.find("-forge-"); if (k != std::string::npos) { r.loader = "Forge"; r.mc = n.substr(0, k); } }
+    return r;
+}
+static void ScanInsts() {
+    gInsts.clear(); std::error_code ec;
+    for (auto& e : fs::directory_iterator(gRoot / "instances", ec)) if (e.is_directory(ec)) gInsts.push_back(ParseInst(U8(e.path().filename().wstring())));
+    std::sort(gInsts.begin(), gInsts.end(), [](const InstInfo& a, const InstInfo& b) { return a.dir > b.dir; });
+}
+static void CalcInstStat(const InstInfo& in) {
+    InstStat st; std::error_code ec; fs::path d = gRoot / "instances" / P(in.dir); st.path = PS(d);
+    st.client = fs::exists(gRoot / "versions" / P(in.mc) / P(in.mc + ".jar"), ec);
+    if (in.loader == "Fabric") st.profile = !FindInstalled("fabric-loader-", "-" + in.mc).empty();
+    else if (in.loader == "Forge") st.profile = !FindInstalled(in.mc + "-forge-", "").empty();
+    else st.profile = true;
+    for (auto& e : fs::directory_iterator(d / "mods", ec)) if (e.is_regular_file(ec) && e.path().extension() == L".jar") st.mods++;
+    for (auto it = fs::recursive_directory_iterator(d, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        std::error_code e2; if (it->is_regular_file(e2)) { auto z = it->file_size(e2); if (!e2) st.size += (long long)z; }
+    }
+    gInstSt = st;
+}
+static void ScrInstances() {
+    float em = ImGui::GetFontSize(); ImDrawList* dl = ImGui::GetWindowDrawList();
+    if (Header(T("Экземпляры", "Instances"))) { Go(S_MAIN); return; }
+    if (gInstDirty) { gInstDirty = false; ScanInsts(); }
+    if (gInsts.empty()) { ImGui::PushTextWrapPos(0.f); TD(T("Пока нет экземпляров. Папка появится после первого запуска игры или установки мода.", "No instances yet. A folder appears after the first game launch or mod install.")); ImGui::PopTextWrapPos(); return; }
+    TD(T("Клик — выбрать, правая кнопка мыши — информация и настройки", "Click to select, right-click for info and settings"));
+    int ctxReq = -1, modalReq = 0;
+    ImGui::BeginChild("instl", ImVec2(0, 0), 0, ImGuiWindowFlags_NoBackground);
+    for (int i = 0; i < (int)gInsts.size(); i++) {
+        auto& in = gInsts[i]; ImGui::PushID(i);
+        ImVec2 p = ImGui::GetCursorScreenPos(); float w = ImGui::GetContentRegionAvail().x, rh = em * 3.1f;
+        ImGui::InvisibleButton("##row", ImVec2(w, rh));
+        bool hov = ImGui::IsItemHovered(), cur = in.loader == cfg.loader && in.mc == cfg.version;
+        if (ImGui::IsItemClicked(0) && !gBusy) { cfg.loader = in.loader; cfg.version = in.mc; SaveConfig(); }
+        if (ImGui::IsItemClicked(1)) ctxReq = i;
+        float t = AnimK("h", hov ? 1.f : 0.f, 12.f); ImVec4 c = gSoft; c.w = std::min(1.f, c.w + .08f * t);
+        dl->AddRectFilled(p, ImVec2(p.x + w, p.y + rh), ImGui::GetColorU32(c), R(em * .6f));
+        if (cur) dl->AddRect(p, ImVec2(p.x + w, p.y + rh), ImGui::GetColorU32(gAccent), R(em * .6f), 0, 1.5f * gS);
+        std::string t1 = in.loader + "  " + in.mc;
+        dl->AddText(ImVec2(p.x + em, p.y + em * .55f), cur ? ImGui::GetColorU32(gAccent) : TextCol(), t1.c_str());
+        dl->AddText(ImVec2(p.x + em, p.y + em * .55f + em * 1.3f), TextCol(.5f), in.dir.c_str());
+        ImGui::PopID();
+    }
+    if (ctxReq >= 0) { gInstCtx = ctxReq; ImGui::OpenPopup("##instctx"); }
+    if (ImGui::BeginPopup("##instctx")) {
+        if (gInstCtx >= 0 && gInstCtx < (int)gInsts.size()) {
+            if (ImGui::Selectable(T("Информация", "Information"))) modalReq = 1;
+            if (ImGui::Selectable(T("Настройки", "Settings"))) modalReq = 2;
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::EndChild();
+    if (modalReq && gInstCtx >= 0 && gInstCtx < (int)gInsts.size()) { gInstModal = modalReq; if (modalReq == 1) CalcInstStat(gInsts[gInstCtx]); ImGui::OpenPopup("###instm"); }
+    std::string title = std::string(gInstModal == 2 ? T("Настройки экземпляра", "Instance settings") : T("Информация", "Information")) + "###instm";
+    ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x / 2, ImGui::GetIO().DisplaySize.y / 2), ImGuiCond_Always, ImVec2(.5f, .5f));
+    ImGui::SetNextWindowSize(ImVec2(std::min(em * 30, ImGui::GetIO().DisplaySize.x - em * 2), 0));
+    if (ImGui::BeginPopupModal(title.c_str(), nullptr, ImGuiWindowFlags_NoResize)) {
+        if (gInstCtx >= 0 && gInstCtx < (int)gInsts.size()) {
+            auto& in = gInsts[gInstCtx];
+            ImGui::SetWindowFontScale(1.25f); ImGui::TextColored(gAccent, "%s  %s", in.loader.c_str(), in.mc.c_str()); ImGui::SetWindowFontScale(1.f);
+            ImGui::Separator();
+            if (gInstModal == 1) {
+                const InstStat& st = gInstSt; char sz[48];
+                if (st.size >= (1LL << 30)) snprintf(sz, sizeof(sz), "%.2f GB", st.size / 1073741824.0); else snprintf(sz, sizeof(sz), "%.1f MB", st.size / 1048576.0);
+                TD(T("Клиент игры", "Game client")); ImGui::Text("%s", st.client ? T("скачан", "downloaded") : T("не скачан", "not downloaded"));
+                if (in.loader != "Vanilla") { TD(T("Профиль загрузчика", "Loader profile")); ImGui::Text("%s", st.profile ? T("установлен", "installed") : T("не установлен", "not installed")); }
+                TD(T("Модов", "Mods")); ImGui::Text("%d", st.mods);
+                TD(T("Размер папки", "Folder size")); ImGui::Text("%s", sz);
+                TD(T("Папка", "Folder")); ImGui::TextWrapped("%s", st.path.c_str());
+            } else TD(T("Пока пусто", "Nothing here yet"));
+        }
+        ImGui::Dummy(ImVec2(0, em * .5f));
+        if (gInstModal == 1 && gInstCtx >= 0 && gInstCtx < (int)gInsts.size()) { if (ImGui::Button(T("Открыть папку", "Open folder"), ImVec2(em * 9, 0))) Open(gRoot / "instances" / P(gInsts[gInstCtx].dir)); ImGui::SameLine(); }
+        if (ImGui::Button(T("Закрыть", "Close"), ImVec2(em * 8, 0))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
 }
 
 static void ScrLog() {
@@ -1490,8 +1567,24 @@ static void DrawUI(float W, float H) {
     ImGui::Begin("root", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
     ImGui::PopStyleVar(2);
     float em = ImGui::GetFontSize(), intro = AnimK("intro", 1.f, 2.5f);
-    float pw = W - em * 2.4f, px = em * 1.2f - (1 - intro) * em * 3, py = em * 1.2f, ph = H - em * 2.4f;
+    gTitleH = em * 2.1f;
+    float pw = W - em * 2.4f, px = em * 1.2f - (1 - intro) * em * 3, py = gTitleH, ph = H - gTitleH - em * 1.2f;
     ImDrawList* dl = ImGui::GetWindowDrawList();
+    { // свои кнопки окна (системной рамки нет): свернуть и закрыть; пустая часть полосы таскает окно
+        float bs = em * 1.7f, gap = em * .35f, mx = W - em * 1.2f - bs * 2 - gap, my = (gTitleH - bs) / 2 + em * .15f;
+        gCtrlX = mx - em * .4f;
+        for (int k = 0; k < 2; k++) {
+            ImGui::PushID(k); ImGui::SetCursorPos(ImVec2(mx + k * (bs + gap), my));
+            ImVec2 a = ImGui::GetCursorScreenPos(), b(a.x + bs, a.y + bs), m((a.x + b.x) / 2, (a.y + b.y) / 2);
+            bool clk = ImGui::InvisibleButton("##wc", ImVec2(bs, bs)); float t = AnimK("h", ImGui::IsItemHovered() ? 1.f : 0.f, 14.f);
+            ImVec4 c = k == 1 ? ImVec4(.92f, .30f, .30f, .0f) : gSoft; if (k == 1) c.w = .14f + .45f * t; else c.w = std::min(1.f, c.w + .08f * t);
+            dl->AddRectFilled(a, b, ImGui::GetColorU32(k == 1 ? c : ImVec4(c.x, c.y, c.z, c.w)), R(bs * .28f));
+            if (k == 0) dl->AddLine(ImVec2(m.x - bs * .22f, m.y + bs * .12f), ImVec2(m.x + bs * .22f, m.y + bs * .12f), TextCol(), 2.f * gS);
+            else IconCross(dl, m, bs * .22f, TextCol());
+            if (clk) { if (k == 0) ShowWindow(gHwnd, SW_MINIMIZE); else PostMessageW(gHwnd, WM_CLOSE, 0, 0); }
+            ImGui::PopID();
+        }
+    }
     dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph), cfg.light ? IM_COL32(246, 248, 252, (int)(228 * intro)) : IM_COL32(14, 17, 26, (int)(190 * intro)), R(em * .9f));
     dl->AddRect(ImVec2(px, py), ImVec2(px + pw, py + ph), cfg.light ? IM_COL32(0, 0, 0, (int)(40 * intro)) : IM_COL32(255, 255, 255, (int)(30 * intro)), R(em * .9f));
     ImGui::SetCursorPos(ImVec2(px + em, py + em));
@@ -1501,7 +1594,7 @@ static void DrawUI(float W, float H) {
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (1 - gScrFade) * em * .8f);
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, intro * gScrFade);
     ImGui::BeginChild("content", ImVec2(0, 0), false, ImGuiWindowFlags_NoBackground);
-    switch (gScr) { case S_ACC: ScrAccounts(); break; case S_MODS: ScrMods(); break; case S_SET: ScrSettings(); break; case S_LOG: ScrLog(); break; default: ScrMain(); }
+    switch (gScr) { case S_ACC: ScrAccounts(); break; case S_MODS: ScrMods(); break; case S_SET: ScrSettings(); break; case S_LOG: ScrLog(); break; case S_INST: ScrInstances(); break; default: ScrMain(); }
     ImGui::EndChild();
     ImGui::PopStyleVar();
     ImGui::EndChild();
@@ -1532,6 +1625,23 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_SIZE:
         if (gDev && w != SIZE_MINIMIZED) { if (gRTV) { gRTV->Release(); gRTV = nullptr; } gSwap->ResizeBuffers(0, LOWORD(l), HIWORD(l), DXGI_FORMAT_UNKNOWN, 0); CreateRTV(); }
         return 0;
+    case WM_NCCALCSIZE:
+        if (w) { // клиентская область = всё окно (системной рамки и заголовка нет)
+            if (IsZoomed(h)) { MONITORINFO mi{sizeof(mi)}; GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi); ((NCCALCSIZE_PARAMS*)l)->rgrc[0] = mi.rcWork; }
+            return 0;
+        }
+        break;
+    case WM_NCHITTEST: {
+        POINT pt{(short)LOWORD(l), (short)HIWORD(l)}; RECT wr; GetWindowRect(h, &wr);
+        if (!IsZoomed(h)) {
+            int b = (int)(6 * gS); bool L = pt.x < wr.left + b, Rr = pt.x >= wr.right - b, Tp = pt.y < wr.top + b, Bt = pt.y >= wr.bottom - b;
+            if (Tp && L) return HTTOPLEFT; if (Tp && Rr) return HTTOPRIGHT; if (Bt && L) return HTBOTTOMLEFT; if (Bt && Rr) return HTBOTTOMRIGHT;
+            if (L) return HTLEFT; if (Rr) return HTRIGHT; if (Tp) return HTTOP; if (Bt) return HTBOTTOM;
+        }
+        POINT c = pt; ScreenToClient(h, &c);
+        if (c.y >= 0 && c.y < (LONG)gTitleH && c.x < (LONG)gCtrlX) return HTCAPTION;
+        return HTCLIENT;
+    }
     case WM_GETMINMAXINFO: { MINMAXINFO* mm = (MINMAXINFO*)l; mm->ptMinTrackSize.x = (LONG)(900 * gS); mm->ptMinTrackSize.y = (LONG)(600 * gS); return 0; }
     case WM_SYSCOMMAND: if ((w & 0xfff0) == SC_KEYMENU) return 0; break;
     case WM_DESTROY: PostQuitMessage(0); return 0;
@@ -1545,7 +1655,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int) {
     std::error_code ec; fs::create_directories(gCfgDir, ec);
     WNDCLASSEXW wc{sizeof(wc), CS_CLASSDC, WndProc, 0, 0, hi, nullptr, LoadCursor(nullptr, IDC_ARROW), nullptr, nullptr, L"MCL", nullptr};
     RegisterClassExW(&wc);
-    gHwnd = CreateWindowW(L"MCL", L"PoltergeistLauncher", WS_OVERLAPPEDWINDOW, 100, 100, (int)(1100 * S), (int)(680 * S), nullptr, nullptr, hi, nullptr);
+    gHwnd = CreateWindowW(L"MCL", L"PoltergeistLauncher", WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU, 100, 100, (int)(1100 * S), (int)(680 * S), nullptr, nullptr, hi, nullptr);
 
     DXGI_SWAP_CHAIN_DESC sd{}; sd.BufferCount = 2; sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.OutputWindow = gHwnd; sd.SampleDesc.Count = 1; sd.Windowed = TRUE; sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
@@ -1553,6 +1663,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int) {
     if (FAILED(D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, lv, 2, D3D11_SDK_VERSION, &sd, &gSwap, &gDev, &fl, &gCtx))) {
         MessageBoxW(nullptr, L"Не удалось создать Direct3D 11", L"PoltergeistLauncher", MB_ICONERROR); return 1;
     }
+    SetWindowPos(gHwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
     CreateRTV();
     ShowWindow(gHwnd, SW_SHOWDEFAULT); UpdateWindow(gHwnd);
 
